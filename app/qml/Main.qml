@@ -268,6 +268,8 @@ Window {
         // asking, it goes and the other clip's comes.
         function onOpenClip(clip) { Qt.callLater(() => { editor.source = ""; editor.setSource("EditorPage.qml", { entry: clip }) }) }
         function onSay(message) { window.say(message) }
+        // From the settings: the first steps once more.
+        function onWelcome() { Qt.callLater(() => { editor.source = ""; editor.setSource("WelcomePage.qml", {}) }) }
     }
 
     // `--edit` opens the newest clip in the editor at once; `--size

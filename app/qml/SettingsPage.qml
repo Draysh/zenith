@@ -7,6 +7,8 @@ FocusScope {
     id: page
     signal closed()
     signal say(string message)
+    // The welcome's steps, again.
+    signal welcome()
 
     property var cfg: JSON.parse(Settings.load())
     // The monitors and codecs arrive a moment after the page opens.
@@ -635,7 +637,12 @@ FocusScope {
 
             SettingGroup {
                 title: "Setup check"
-                Checks { id: setupChecks }
+                Checks { id: setupChecks; onSay: message => page.say(message) }
+                SettingRow {
+                    label: "First steps"
+                    note: "The key, when to record and what goes into a clip, one step at a time, as when Zenith was new."
+                    Btn { implicitHeight: 32; text: "Show the welcome"; onClicked: { page.flush(); Settings.welcomeAgain(); page.welcome() } }
+                }
                 SettingRow {
                     label: "Check again"
                     note: "After installing something or changing a setting above."

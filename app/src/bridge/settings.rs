@@ -98,6 +98,24 @@ pub mod ffi {
         fn first_run(self: &Settings) -> bool;
         #[qinvokable]
         fn welcome_done(self: &Settings);
+        /// Show the welcome screen at the next start (or now: Main loads it).
+        #[qinvokable]
+        fn welcome_again(self: &Settings);
+        /// Whether a one-time hint (`"first-clip"`) has been seen through.
+        #[qinvokable]
+        fn hint_seen(self: &Settings, name: &QString) -> bool;
+        #[qinvokable]
+        fn hint_done(self: &Settings, name: &QString);
+        /// Start the background recorder: through the user's service
+        /// manager where it has Zenith's unit, else as a program of its
+        /// own. Returns why it could not be, empty when it was begun (it
+        /// takes a moment to be up: check again after).
+        #[qinvokable]
+        fn start_recorder(self: &Settings) -> QString;
+        /// The games Zenith can tell are running without being told:
+        /// `{count, names: [up to 3], from: "Steam" | "Steam, Epic, ..."}`.
+        #[qinvokable]
+        fn games_found(self: &Settings) -> QString;
         /// The app's icon in the colours the app is in: the tile, the Z
         /// on it and the dot, each "#RRGGBB". The window's icon at once;
         /// on Linux also the icon the desktop shows for the app (its
@@ -287,6 +305,39 @@ impl ffi::Settings {
         let _ = std::fs::write(marker, b"");
     }
 
+    fn welcome_again(&self) {
+        let _ = std::fs::remove_file(paths::data_dir().join("welcomed"));
+    }
+
+    fn hint_seen(&self, name: &QString) -> bool {
+        hint_marker(&name.to_string()).is_some_and(|marker| marker.exists())
+    }
+
+    fn hint_done(&self, name: &QString) {
+        let Some(marker) = hint_marker(&name.to_string()) else { return };
+        if let Some(dir) = marker.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(marker, b"");
+    }
+
+    fn start_recorder(&self) -> QString {
+        QString::from(&start_recorder().err().unwrap_or_default())
+    }
+
+    fn games_found(&self) -> QString {
+        use zenith_core::games::{launchers, steam};
+        let mut names: Vec<String> = steam::installed(&steam::roots(&paths::home())).into_iter().map(|g| g.name).collect();
+        let from_steam = !names.is_empty();
+        let others: Vec<String> = launchers::installed().into_iter().map(|g| g.name).collect();
+        names.extend(others.iter().cloned());
+        names.sort_by_key(|n| n.to_lowercase());
+        names.dedup();
+        let from = if cfg!(windows) { "Steam, Epic, GOG, Ubisoft, Battle.net, the EA app, Riot, Rockstar and Xbox" } else { "Steam" };
+        let value = json!({ "count": names.len(), "names": names.iter().take(3).collect::<Vec<_>>(), "from": from, "steam": from_steam });
+        QString::from(&value.to_string())
+    }
+
     fn hotkey_problem(&self, combination: &QString) -> QString {
         let wrong = combination.to_string().parse::<zenith_core::hotkey::Hotkey>().err().unwrap_or_default();
         QString::from(&wrong)
@@ -393,4 +444,49 @@ fn keep_desktop_icon(colours: &[String; 3]) {
         // has changed.
         let _ = std::fs::File::open(&theme).and_then(|dir| dir.set_modified(std::time::SystemTime::now()));
     }
+}
+
+/// Where a one-time hint is marked as seen. Only plain names: a name is
+/// a file's.
+fn hint_marker(name: &str) -> Option<std::path::PathBuf> {
+    let plain = !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+    plain.then(|| paths::data_dir().join("hints").join(name))
+}
+
+/// Begin the background recorder. On Linux through systemd when the user
+/// has Zenith's unit (so it also starts with the next session), else, and
+/// on Windows, as a program of its own without a window.
+fn start_recorder() -> Result<(), String> {
+    use std::process::Stdio;
+    if ipc::ask(&paths::socket(), &Request::Status, Duration::from_millis(500)).is_ok() {
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let has_unit = std::process::Command::new("systemctl")
+            .args(["--user", "cat", "zenithd.service"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if has_unit {
+            let out = std::process::Command::new("systemctl")
+                .args(["--user", "enable", "--now", "zenithd.service"])
+                .stdin(Stdio::null())
+                .output()
+                .map_err(|e| format!("The recorder could not be started: {e}"))?;
+            if out.status.success() {
+                return Ok(());
+            }
+            let said = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            return Err(format!("The recorder could not be started: {said}"));
+        }
+    }
+    paths::command("zenithd")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("The recorder could not be started: {e}"))
 }

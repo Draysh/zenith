@@ -1263,8 +1263,10 @@ mod tests {
         recorder.db.busy_timeout(std::time::Duration::from_millis(100)).unwrap();
         let adds = std::cell::Cell::new(0);
         let probe = |p: &Path| {
-            // While each file is read, the recorder files the clip it saved.
-            recorder.add(&d.join("Hades/saved.mp4"), "Hades", 500, &meta(20.0), &[Track::Game]).unwrap();
+            // While each file is read, the recorder files the clip it saved,
+            // spelled as the folder's listing spells it (on Windows, with
+            // backward slashes throughout).
+            recorder.add(&d.join("Hades").join("saved.mp4"), "Hades", 500, &meta(20.0), &[Track::Game]).unwrap();
             adds.set(adds.get() + 1);
             real_size(p)
         };

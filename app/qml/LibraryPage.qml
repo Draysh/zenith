@@ -28,6 +28,17 @@ Item {
     property var tags: []
     // The clips listed, in the order they are shown.
     property var clips: []
+    // What the recorder says, for an empty library to tell what is next:
+    // the key, how far back a clip reaches, whether it runs at all.
+    property var recorder: ({ running: true })
+    Connections {
+        target: Recorder
+        function onStatusReady(status) { page.recorder = JSON.parse(status) }
+    }
+    // The games Zenith finds by itself, asked once, when there are no clips.
+    property var games: null
+    // The first clip is shown where to go next, once.
+    property bool firstClipHint: !Settings.hintSeen("first-clip")
     // The rows of the grid: up to `columns` clips each, the first of a
     // group under its heading.
     property var rows: []
@@ -70,6 +81,28 @@ Item {
 
     // Read the library again. `listOnly` leaves the games' shelves as they
     // are, for when only what is listed changed (a search, another place).
+    // What an empty library says: the key, how far back a clip reaches,
+    // where games come from, and that videos can be brought in.
+    function firstWords() {
+        if (page.games === null) { page.games = JSON.parse(Settings.gamesFound()) }
+        const key = page.recorder.hotkey || ""
+        const secs = page.recorder.bufferSecs || 0
+        const back = secs === 60 ? "minute" : secs > 0 && secs % 60 === 0 ? secs / 60 + " minutes" : secs > 0 ? secs + " seconds" : "moments"
+        const lines = []
+        if (!page.recorder.running) {
+            lines.push("The recorder is not running, so nothing is being kept.")
+        } else {
+            lines.push("Press " + (key ? key : "your clip key") + " while a game is running\nand what happened in the last " + back + " lands here.")
+        }
+        if (page.games.count > 0) {
+            lines.push("Zenith knows " + page.games.count + " of your games through " + (Qt.platform.os === "windows" ? "your launchers" : "Steam") + ".\nAny other can be added in the settings.")
+        } else {
+            lines.push("Zenith found no games here by itself:\nadd yours in the settings, or record always.")
+        }
+        lines.push("Videos made elsewhere can be dropped onto this window.")
+        return lines.join("\n\n")
+    }
+
     function refresh(listOnly) {
         if (!listOnly) {
             shelvesText = Library.shelves()
@@ -437,9 +470,48 @@ Item {
                 }
             }
 
+            // The first clip there is: what can be done with it, once.
+            Rectangle {
+                id: hint
+                visible: page.firstClipHint && page.total > 0 && search.text === "" && page.place === "" && page.tag === ""
+                anchors.top: bar.bottom
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.leftMargin: 28
+                anchors.rightMargin: 28
+                height: visible ? hintWords.implicitHeight + 28 : 0
+                radius: Theme.radiusLarge
+                color: Theme.surface
+                border.color: Theme.accent
+                Text {
+                    id: hintWords
+                    anchors.left: parent.left
+                    anchors.right: hintDone.left
+                    anchors.leftMargin: 16
+                    anchors.rightMargin: 16
+                    anchors.verticalCenter: parent.verticalCenter
+                    wrapMode: Text.WordWrap
+                    text: "Your first clip is here. Open it to trim it, cut parts out, turn the voices down, and export it at a size Discord takes."
+                    color: Theme.text
+                    font.family: Theme.family
+                    font.pixelSize: Theme.body
+                    lineHeight: 1.3
+                }
+                Btn {
+                    id: hintDone
+                    anchors.right: parent.right
+                    anchors.rightMargin: 12
+                    anchors.verticalCenter: parent.verticalCenter
+                    implicitHeight: 32
+                    text: "Got it"
+                    onClicked: { Settings.hintDone("first-clip"); page.firstClipHint = false }
+                }
+            }
+
             VirtualRows {
                 id: grid
-                anchors.top: bar.bottom
+                anchors.top: hint.visible ? hint.bottom : bar.bottom
+                anchors.topMargin: hint.visible ? 16 : 0
                 anchors.bottom: parent.bottom
                 anchors.left: parent.left
                 anchors.right: parent.right
@@ -644,11 +716,24 @@ Item {
                     horizontalAlignment: Text.AlignHCenter
                     text: search.text !== "" ? "Try another word, a tag, or a game's name."
                         : page.place === "★" ? "Star a clip to keep it here."
-                        : "Press your clip shortcut while a game is running\nand the last moments land here.\nVideos made elsewhere can be dropped onto this window."
+                        : page.firstWords()
                     color: Theme.textDim
                     font.family: Theme.family
                     font.pixelSize: Theme.body
                     lineHeight: 1.3
+                }
+                // A recorder that is not running is started from here.
+                Btn {
+                    visible: search.text === "" && page.place === "" && !page.recorder.running
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    implicitHeight: 34
+                    icon: "play"
+                    text: "Start the recorder"
+                    onClicked: {
+                        const wrong = Settings.startRecorder()
+                        if (wrong !== "") { page.say(wrong) }
+                        Recorder.poll()
+                    }
                 }
             }
         }

@@ -8,8 +8,10 @@ Column {
     width: parent ? parent.width : 0
     spacing: 10
 
-    // The group's name, with a rule running on from it to the edge.
+    // The group's name, with a rule running on from it to the edge. A card
+    // without a name is the card alone.
     Item {
+        visible: group.title !== ""
         width: parent.width
         height: name.implicitHeight
         Text {

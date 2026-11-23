@@ -11,7 +11,14 @@ to what the version does. A release is not built without one.
 
 ## 0.12.0
 
-**A safer, steadier Zenith.** A top-to-bottom check of the code turned up ways to lose things; this version closes them.
+**A safer, steadier Zenith, and a better first start.** A top-to-bottom check of the code turned up ways to lose things; this version closes them.
+
+### Getting started
+- **A first start in three short steps.** Fix what stands in the way (only if something does), pick your clip key, and choose what goes into a clip, your microphone included.
+- **Fixes, not instructions.** A recorder that is not running gets a "Start it" button.
+- **An empty library says what to do.** Which key to press, how far back a clip reaches, and how many of your games Zenith already knows.
+- **A pointer at your first clip** to what you can do with it, once.
+- **See the first steps again** from Settings.
 
 ### Your clips and settings
 - **An unplugged drive no longer wipes names and tags.** When the clip folder is on a drive that is not there, Zenith leaves the library alone until it is back.

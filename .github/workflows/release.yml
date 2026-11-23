@@ -1,0 +1,174 @@
+# A release is made from `main`: when a push there brings a version in
+# Cargo.toml that is not out yet, the programs are checked, built for Linux
+# and Windows, signed with the update key and published where installed
+# copies look for them; the commit then gets the version's tag (v0.2.0).
+# So releasing is: bump the version, finish its patch notes, merge to main.
+# A push to main that brings no new version does nothing here.
+#
+# It runs on `main`, and not on a tag as it used to, for the sake of the
+# build cache: what a run saves can only be read by later runs on the
+# same branch or on branches made from main. Saved from main, the cache
+# serves the next release and every check of a branch; saved from a tag,
+# it served nothing, and each build compiled everything again.
+#
+# This is also the check of what is released: lints and every test run
+# here, before anything is built. There is no need to run Checks first.
+#
+# The files go straight to a draft of the release, which nobody sees until
+# everything has passed and it is published. (They used to be passed
+# between the jobs as build artifacts, and a full artifact store stopped a
+# release.)
+name: Release
+on:
+  push:
+    branches: [main]
+    paths: [Cargo.toml]
+  # To try again, on main, a release that failed for a reason outside the
+  # code.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RELEASES: Draysh/zenith-releases
+
+jobs:
+  draft:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      new: ${{ steps.version.outputs.new }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # The version in Cargo.toml, and whether it is out already: then
+      # there is nothing to do, and no other job starts.
+      - name: Is there a version to release?
+        id: version
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+        run: |
+          test "$GITHUB_REF" = "refs/heads/main" || { echo "a release is made from main, not from $GITHUB_REF"; exit 1; }
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          tag="v$version"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          state=$(gh release view "$tag" --repo "$RELEASES" --json isDraft --jq .isDraft 2>/dev/null || echo none)
+          if [ "$state" = "false" ]; then
+            echo "$tag is already out: nothing to release"
+            echo "new=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "releasing $tag"
+            echo "new=true" >> "$GITHUB_OUTPUT"
+          fi
+      # The patch notes: this version's section of CHANGELOG.md. There is
+      # no release without them.
+      - name: Notes
+        if: steps.version.outputs.new == 'true'
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: ./dist/release/notes.sh "$TAG" > notes.md && cat notes.md
+      - name: A draft to gather the files in
+        if: steps.version.outputs.new == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          # A draft left by a run that failed is started over.
+          if gh release view "$TAG" --repo "$RELEASES" >/dev/null 2>&1; then
+            gh release delete "$TAG" --repo "$RELEASES" --yes
+          fi
+          gh release create "$TAG" --repo "$RELEASES" --draft --title "Zenith ${TAG#v}" --notes-file notes.md
+
+  linux:
+    needs: draft
+    if: needs.draft.outputs.new == 'true'
+    runs-on: ubuntu-latest
+    # Arch has the Qt the screens are written for; Ubuntu's is older.
+    container: archlinux:base-devel
+    env:
+      TAG: ${{ needs.draft.outputs.tag }}
+    steps:
+      - name: What the build needs
+        run: pacman -Syu --noconfirm git rustup qt6-base qt6-declarative mpv sqlite ffmpeg github-cli
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # The Rust that rust-toolchain.toml names, the same as everywhere else.
+      - run: rustup show
+      # What was compiled last time: only what changed is compiled again.
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: linux-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: linux-cargo-
+      - name: Lints
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --locked --workspace
+      - name: Build
+        run: ./dist/release/build-linux.sh
+      - name: Into the draft
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+        run: gh release upload "$TAG" out/*.tar.gz --repo "$RELEASES" --clobber
+      # Kept for the next release, and for the checks of every branch.
+      - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: linux-cargo-${{ hashFiles('Cargo.lock') }}
+
+  windows:
+    needs: draft
+    if: needs.draft.outputs.new == 'true'
+    uses: ./.github/workflows/windows.yml
+    with:
+      release_tag: ${{ needs.draft.outputs.tag }}
+    # Only what it uploads with: the signing key stays with `publish`.
+    secrets:
+      RELEASES_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+
+  publish:
+    needs: [draft, linux, windows]
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    # To put the version's tag on what was released, and nothing else.
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.draft.outputs.tag }}
+    steps:
+      - name: What signing needs
+        run: pacman -Syu --noconfirm git rustup sqlite github-cli
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: The files, from the draft
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+        run: |
+          gh release download "$TAG" --repo "$RELEASES" --dir out
+          ./dist/release/notes.sh "$TAG" > out/notes.md
+          ls -la out
+      - name: Sign
+        env:
+          ZENITH_SIGNING_KEY: ${{ secrets.ZENITH_SIGNING_KEY }}
+          ZENITH_SIGNING_PASSWORD: ${{ secrets.ZENITH_SIGNING_PASSWORD }}
+        run: |
+          cargo run --locked --release -p zenith-sign -- manifest "${TAG#v}" out/notes.md out
+          cargo run --locked --release -p zenith-sign -- sign out/*.tar.gz out/*-setup.exe out/latest.json
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+        run: |
+          gh release upload "$TAG" --repo "$RELEASES" --clobber \
+            out/*.tar.gz.minisig out/*-setup.exe.minisig out/latest.json out/latest.json.minisig
+          gh release edit "$TAG" --repo "$RELEASES" --draft=false --latest
+      # The released commit is named by its version from now on.
+      - name: The tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$TAG" -f sha="$GITHUB_SHA" >/dev/null \
+            || echo "$TAG could not be put on $GITHUB_SHA (is it there already?)"

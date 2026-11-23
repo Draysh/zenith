@@ -1,0 +1,3 @@
+# The keys a release must be signed with, one to a line (a minisign public key).
+# With none here, this build installs no update.
+RWRbpJoO4zv5xIakhl47gZhlVzAgDOk8tGr4aTlTZZ7LBh4HRwdAvPlv

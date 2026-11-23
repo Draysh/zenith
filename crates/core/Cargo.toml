@@ -1,0 +1,32 @@
+[package]
+name = "zenith-core"
+description = "Zenith's logic, without any UI toolkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+rusqlite.workspace = true
+semver = "1"
+minisign-verify = "0.3"
+tar = { version = "0.4", default-features = false }
+flate2 = "1"
+
+# Steam's notes on what it is running, and where it is installed.
+[target.'cfg(windows)'.dependencies]
+winreg = { version = "0.56", default-features = false }
+# The programs that are running, and which one is in front.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+
+[features]
+# SQLite built in, for systems that do not come with it (Windows).
+bundled-sqlite = ["rusqlite/bundled"]
+
+[dev-dependencies]
+tempfile = "3"
+minisign = "0.10"

@@ -1,0 +1,27 @@
+#!/bin/sh
+# A stand-in for gpu-screen-recorder in replay mode, for the daemon's tests.
+# It takes the same command line, keeps running, and on SIGUSR1 "saves a
+# replay": copies $FAKE_GSR_SAMPLE into the -o directory and prints its path.
+# FAKE_GSR_MODE changes its behaviour: crash (exit at once), deaf (ignore
+# SIGUSR1), or unset (work).
+out=""
+[ "$1" = --list-capture-options ] && { echo "DP-1|2560x1440"; echo "portal"; exit 0; }
+[ "$1" = --list-audio-devices ] && { echo "default_output|Default output"; echo "default_input|Default input"; exit 0; }
+echo "$@" > "${FAKE_GSR_ARGS:-/dev/null}"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -o) out="$2"; shift ;;
+    esac
+    shift
+done
+[ "$FAKE_GSR_MODE" = crash ] && { echo "fake-gsr: no capture device" >&2; exit 3; }
+n=0
+save() {
+    [ "$FAKE_GSR_MODE" = deaf ] && return
+    n=$((n + 1))
+    file="$out/Replay_$(date +%Y-%m-%d_%H-%M-%S)_$n.mp4"
+    cp "$FAKE_GSR_SAMPLE" "$file" && echo "$file"
+}
+trap save USR1
+trap 'exit 0' INT TERM
+while :; do sleep 0.05 & wait $!; done

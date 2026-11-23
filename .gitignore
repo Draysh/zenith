@@ -1,0 +1,6 @@
+/target
+/dist/arch/pkg
+/dist/arch/src
+/dist/arch/*.pkg.tar.*
+/out
+app/.qmlls.ini

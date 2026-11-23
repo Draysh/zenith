@@ -1,0 +1,15 @@
+[package]
+name = "zenith-sign"
+description = "Makes Zenith's update key and signs releases with it"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+zenith-core = { path = "../core" }
+minisign = "0.10"
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

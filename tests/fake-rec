@@ -1,0 +1,35 @@
+#!/bin/sh
+# A stand-in for zenith-rec, the recorder Zenith runs on Windows, for the
+# daemon's tests. It takes the same command line as fake-gsr but is told
+# what to do the Windows way: the line "save" on its input "saves a replay"
+# (copies $FAKE_GSR_SAMPLE into the -o directory and prints its path), the
+# line "stop" or its input closing ends it. Signals mean nothing to it, as
+# there are none on Windows. Why it ended is written to $FAKE_REC_ENDED.
+# FAKE_GSR_MODE changes its behaviour: deaf (ignore "save"), or unset (work).
+out=""
+[ "$1" = --list-capture-options ] && { echo "DP-1|2560x1440"; echo "portal"; exit 0; }
+[ "$1" = --list-audio-devices ] && { echo "default_output|Default output"; echo "default_input|Default input"; exit 0; }
+echo "$@" > "${FAKE_GSR_ARGS:-/dev/null}"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -o) out="$2"; shift ;;
+    esac
+    shift
+done
+trap '' USR1 INT TERM
+n=0
+while IFS= read -r line; do
+    case "$line" in
+        save)
+            [ "$FAKE_GSR_MODE" = deaf ] && continue
+            n=$((n + 1))
+            file="$out/Replay_$(date +%Y-%m-%d_%H-%M-%S)_$n.mp4"
+            cp "$FAKE_GSR_SAMPLE" "$file" && echo "$file"
+            ;;
+        stop)
+            echo stop > "${FAKE_REC_ENDED:-/dev/null}"
+            exit 0
+            ;;
+    esac
+done
+echo closed > "${FAKE_REC_ENDED:-/dev/null}"

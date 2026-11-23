@@ -1,0 +1,122 @@
+# Builds Zenith for Windows and its setup program, installs it on the
+# build machine and tries it out. Called by the checks and by a release,
+# which names its tag: the setup program is then put into that release's
+# draft once everything here has passed.
+name: Windows build
+on:
+  workflow_call:
+    inputs:
+      release_tag:
+        type: string
+        default: ""
+    # The one secret this needs, and only for a release: to put the setup
+    # program into the release's draft. The key releases are signed with
+    # is not handed to this build.
+    secrets:
+      RELEASES_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 75
+    env:
+      # What goes into the setup program from elsewhere is named exactly
+      # and checked against its SHA-256 before it is used: the same files
+      # every time, whatever those repositories hold later. To move to a
+      # newer build, change the release, the file and the checksum together
+      # (gh api repos/<repo>/releases/tags/<tag> lists each file's digest).
+      #
+      # libmpv, which the app is linked against (shinchiro/mpv-winbuild-cmake).
+      MPV_RELEASE: "20261111"
+      MPV_FILE: "mpv-dev-x86_64-20261111-git-bcde6b93cc.7z"
+      MPV_SHA256: "273c079b11ea5575822f972756f4c9a71149a5c10130353abeb8586738938452"
+      # ffmpeg (BtbN/FFmpeg-Builds): a build from the end of a month, which
+      # that repository keeps; its daily ones are gone after two weeks.
+      FFMPEG_RELEASE: "autobuild-2026-10-31-12-59"
+      FFMPEG_BUILD: "ffmpeg-N-128227-g4811625b5f-win64-gpl-shared"
+      FFMPEG_SHA256: "3b1a38912999da560d048ccd91590c7e04dc73b75e478300c1053dce8b0689a6"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+      - uses: jurplel/install-qt-action@b344308e4483fc892e0d27b3cd1b173ebdd95f06 # v4
+        with:
+          version: "6.8.3"
+          arch: win64_msvc2022_64
+          cache: true
+      # What was compiled last time: only what changed is compiled again.
+      # It is read by every run and kept by the ones on main alone (the
+      # last step): what another branch or a tag keeps, no other run can
+      # read, and keeping it took minutes and filled the store.
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~\.cargo\registry
+            ~\.cargo\git
+            target
+          key: windows-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: windows-cargo-
+      - name: libmpv and ffmpeg
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          New-Item -ItemType Directory -Force deps | Out-Null
+          # A file that is not the one named above is not used.
+          function Checked($file, $sha256) {
+            $found = (Get-FileHash $file -Algorithm SHA256).Hash
+            if ($found -ne $sha256) { throw "$file is not the file expected: its SHA-256 is $found" }
+          }
+          gh release download $env:MPV_RELEASE --repo shinchiro/mpv-winbuild-cmake --pattern $env:MPV_FILE --dir deps
+          Checked "deps\$env:MPV_FILE" $env:MPV_SHA256
+          7z x "deps\$env:MPV_FILE" -odeps\mpv -y | Out-Null
+          # The library as MSVC links it, from the list of what it exports.
+          lib /def:deps\mpv\mpv.def /name:libmpv-2.dll /out:deps\mpv\mpv.lib /machine:x64
+          gh release download $env:FFMPEG_RELEASE --repo BtbN/FFmpeg-Builds --pattern "$env:FFMPEG_BUILD.zip" --dir deps
+          Checked "deps\$env:FFMPEG_BUILD.zip" $env:FFMPEG_SHA256
+          Expand-Archive "deps\$env:FFMPEG_BUILD.zip" -DestinationPath deps
+          "MPV_DIR=$PWD\deps\mpv" >> $env:GITHUB_ENV
+          "FFMPEG_DIR=$PWD\deps\$env:FFMPEG_BUILD" >> $env:GITHUB_ENV
+          # The tests use ffmpeg too.
+          "$PWD\deps\$env:FFMPEG_BUILD\bin" >> $env:GITHUB_PATH
+          Get-ChildItem deps\mpv
+      - name: Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "C:\Program Files (x86)\Inno Setup 6\ISCC.exe")) { choco install innosetup --no-progress -y }
+      - name: Build
+        shell: pwsh
+        run: .\dist\windows\build.ps1
+      # Kept a day, for trying a build that is not a release. A full
+      # artifact store must not stop the build: the release does not use it.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: inputs.release_tag == ''
+        continue-on-error: true
+        with:
+          name: windows-setup
+          path: out/*-setup.exe
+          retention-days: 1
+      # The build is not installed and tried out here: that is done by
+      # hand, on a real computer, with the build itself. The script that
+      # did it is still there to run (dist/windows/smoke.ps1).
+      - name: Tests
+        run: cargo test --locked -p zenith-core -p zenith-daemon -p zenith-rec --features zenith-core/bundled-sqlite
+      - name: Into the release's draft
+        if: inputs.release_tag != ''
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+          # Handed over as a value, not written into the command.
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: gh release upload $env:RELEASE_TAG (Get-ChildItem out\*-setup.exe).FullName --repo Draysh/zenith-releases --clobber
+      - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        if: github.ref == 'refs/heads/main'
+        with:
+          path: |
+            ~\.cargo\registry
+            ~\.cargo\git
+            target
+          key: windows-cargo-${{ hashFiles('Cargo.lock') }}

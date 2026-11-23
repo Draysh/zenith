@@ -1,0 +1,15 @@
+[Unit]
+Description=Zenith clip recorder
+PartOf=graphical-session.target
+After=graphical-session.target pipewire.service
+
+[Service]
+ExecStart=%h/.local/bin/zenithd
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=3
+# The recorder is its child: stopping the service stops both.
+KillMode=control-group
+
+[Install]
+WantedBy=graphical-session.target

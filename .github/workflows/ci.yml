@@ -1,0 +1,52 @@
+# The checks: the tests and lints on Linux, and Zenith built, installed
+# and tried out on Windows. They take a while and cost build minutes, so
+# they do not run on every push. A release runs all of this itself
+# (release.yml), so there is no need to run them before one; they are for
+# trying a branch before it is merged, started by hand from the Actions
+# page or with
+#   gh workflow run Checks --ref <branch>
+name: Checks
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    # Arch has the Qt the screens are written for; Ubuntu's is older.
+    container: archlinux:base-devel
+    steps:
+      - name: What the build needs
+        run: pacman -Syu --noconfirm git rustup qt6-base qt6-declarative mpv sqlite ffmpeg
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # The Rust that rust-toolchain.toml names, the same as everywhere else.
+      - run: rustup show
+      # What the last release compiled (kept from main): only what
+      # changed since is compiled again.
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: linux-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: linux-cargo-
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace
+      # Kept when the checks are run on main itself, as a release keeps it.
+      - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        if: github.ref == 'refs/heads/main'
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: linux-cargo-${{ hashFiles('Cargo.lock') }}
+  windows:
+    uses: ./.github/workflows/windows.yml

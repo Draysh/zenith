@@ -1,0 +1,37 @@
+[package]
+name = "zenith-daemon"
+description = "Zenith's background recorder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "zenithd"
+path = "src/main.rs"
+
+[dependencies]
+zenith-core = { path = "../core" }
+serde_json.workspace = true
+chrono.workspace = true
+
+tokio = { version = "1.54.1", features = ["rt", "macros", "process", "signal", "net", "time", "io-util", "sync"] }
+
+# Signals, the socket's owner, the tray icon and notifications with buttons.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.191"
+notify-rust = { version = "4.19.0", default-features = false, features = ["z"] }
+ksni = "0.3.7"
+
+# Toasts, the save hotkey and the tray icon with the message loops they
+# need, the save sound, and the notice drawn over a game.
+[target.'cfg(windows)'.dependencies]
+notify-rust = { version = "4.19.0", default-features = false }
+global-hotkey = "0.10"
+tray-icon = { version = "0.26.1", default-features = false }
+png = "0.18.1"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Media_Audio", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging"] }
+
+[dev-dependencies]
+# Reads the tray icon's image, which only Windows shows but every test checks.
+png = "0.18.1"
+tempfile = "3.27.0"

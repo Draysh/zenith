@@ -1,0 +1,39 @@
+# Builds Zenith from this checkout: run `makepkg -si` in this folder.
+pkgname=zenith-clips
+pkgver=0.4.0
+pkgrel=1
+pkgdesc="Clip the last minute of any game: replay buffer, clip library, editor and Discord-size export"
+arch=('x86_64')
+license=('GPL-3.0-or-later')
+# pipewire-audio has pw-play (the save sound); xdg-utils opens the clip folder from the tray.
+depends=('gpu-screen-recorder' 'ffmpeg' 'mpv' 'qt6-base' 'qt6-declarative' 'sqlite' 'pipewire-audio' 'xdg-utils')
+makedepends=('cargo' 'gcc')
+optdepends=('libpulse: the save sound through paplay when pw-play cannot play it')
+options=('!lto' '!debug')
+
+_root="$startdir/../.."
+
+pkgver() {
+    sed -n 's/^version = "\(.*\)"/\1/p' "$_root/Cargo.toml" | head -1
+}
+
+build() {
+    cd "$_root"
+    cargo build --release --locked -p zenith-daemon -p zenith
+}
+
+check() {
+    cd "$_root"
+    cargo test --release --locked -p zenith-core --lib
+}
+
+package() {
+    cd "$_root"
+    install -Dm755 target/release/zenithd "$pkgdir/usr/bin/zenithd"
+    install -Dm755 target/release/zenith-clips "$pkgdir/usr/bin/zenith-clips"
+    install -Dm644 dist/zenith-clips.desktop "$pkgdir/usr/share/applications/zenith-clips.desktop"
+    install -Dm644 dist/icons/zenith-clips.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/zenith-clips.svg"
+    # The unit as shipped runs the copy in the home folder; the package's is in /usr/bin.
+    sed 's|%h/.local/bin/zenithd|/usr/bin/zenithd|' dist/zenithd.service |
+        install -Dm644 /dev/stdin "$pkgdir/usr/lib/systemd/user/zenithd.service"
+}

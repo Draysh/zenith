@@ -28,6 +28,9 @@ class MpvItem : public QQuickFramebufferObject
   Q_PROPERTY(double volume READ volume WRITE setVolume NOTIFY volumeChanged)
   // A file is loaded and can be played and seeked.
   Q_PROPERTY(bool loaded READ loaded NOTIFY loadedChanged)
+  // The picture can be drawn: mpv has its OpenGL drawing context. Where
+  // this never comes true, there is no picture to show.
+  Q_PROPERTY(bool canDraw READ canDraw NOTIFY canDrawChanged)
 
 public:
   explicit MpvItem(QQuickItem* parent = nullptr);
@@ -43,6 +46,7 @@ public:
   double volume() const { return m_volume; }
   void setVolume(double volume);
   bool loaded() const { return m_loaded; }
+  bool canDraw() const { return m_canDraw; }
 
   // Go to `seconds`. Exact lands on that frame; otherwise on the keyframe
   // before it, which is fast enough to follow a drag.
@@ -67,6 +71,7 @@ signals:
   void pausedChanged();
   void volumeChanged();
   void loadedChanged();
+  void canDrawChanged();
   // Playback reached the end of the file.
   void ended();
   // The file could not be played.

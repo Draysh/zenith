@@ -15,7 +15,6 @@
 use crate::audio::Source;
 use std::collections::VecDeque;
 use std::io::Write;
-use std::process::ChildStdin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
@@ -31,7 +30,9 @@ const TICK: Duration = Duration::from_millis(10);
 /// pieces.
 const MAX_CHUNK: usize = RATE as usize / 10;
 /// Falling this far behind the clock (the machine slept, ffmpeg stopped
-/// reading) is not caught up: the time is skipped instead.
+/// reading) is not caught up with sound: the time is skipped instead, and
+/// the [`Sink`] puts silence in its place, so that what comes after is
+/// still where it belongs.
 const LATE_LIMIT: u64 = RATE as u64 * 2;
 /// How much a track holds beyond what is taken when it starts to play:
 /// two of the 10 ms packets sound devices deliver. The clock takes sound
@@ -174,11 +175,13 @@ pub struct Mixer {
     pacer: Pacer,
     one: Vec<f32>,
     block: Vec<u8>,
+    /// The skipped frames [`Mixer::take_skipped`] has told of already.
+    told: u64,
 }
 
 impl Mixer {
     pub fn new(sources: Vec<Box<dyn Source>>) -> Self {
-        Self { sources, pacer: Pacer::default(), one: Vec::new(), block: Vec::new() }
+        Self { sources, pacer: Pacer::default(), one: Vec::new(), block: Vec::new(), told: 0 }
     }
 
     /// The bytes to write at `elapsed` since the start: the frames now due,
@@ -204,9 +207,22 @@ impl Mixer {
         &self.block
     }
 
+    /// The frames the clock skipped since this was last asked: time that
+    /// passed with nothing written for it.
+    pub fn take_skipped(&mut self) -> u64 {
+        let new = self.pacer.skipped() - self.told;
+        self.told += new;
+        new
+    }
+
+    /// Bytes in one frame of the stream: a stereo pair for every track.
+    pub fn frame_bytes(&self) -> usize {
+        self.sources.len() * CHANNELS * 4
+    }
+
     /// Bytes in a second of the stream.
     pub fn bytes_a_second(&self) -> usize {
-        self.sources.len() * CHANNELS * 4 * RATE as usize
+        self.frame_bytes() * RATE as usize
     }
 
     /// A line for the log about each track since the start.
@@ -239,8 +255,16 @@ const PIPE_ROOM: usize = 64 * 1024;
 const WAITED: Duration = Duration::from_millis(20);
 /// How much sound may wait for ffmpeg to take it, in seconds of stream.
 /// It reads in bursts, a tenth of a second apart at the worst; beyond
-/// this it has stopped, and what it has not taken by then is left out.
+/// this it has stopped, and what it has not taken by then is left out,
+/// with as much silence owed in its place.
 const MAX_WAITING_SECS: usize = 2;
+/// The most silence handed over in one go when making up for sound that
+/// was left out, as a share of what may wait: half a second, so a long
+/// debt is paid in pieces and never held in memory whole.
+const SILENCE_SHARE: usize = 4;
+/// Owing this many times what may wait (half a minute of sound) is past
+/// making up for: the recorder starts that ffmpeg afresh instead.
+const MAX_OWED: usize = 15;
 
 /// What the mixer and the thread writing to one ffmpeg both know.
 #[derive(Default)]
@@ -260,12 +284,19 @@ struct Flow {
 struct Writer {
     blocks: mpsc::Sender<Vec<u8>>,
     flow: Arc<Flow>,
+    /// Bytes of sound this ffmpeg was due and never given, since it began
+    /// to read: it counts samples, so each one missing would put all that
+    /// follows too early. As many are written as silence as soon as it
+    /// takes them, and only then is sound passed on again.
+    owed: usize,
+    /// More is owed than is worth making up for.
+    fell_behind: bool,
 }
 
 /// Write what arrives on `blocks` to ffmpeg, waiting as long as each
 /// write takes; closing the pipe when there is no more to come, which is
 /// also how ffmpeg learns the sound has ended.
-fn write_blocks(mut pipe: ChildStdin, blocks: mpsc::Receiver<Vec<u8>>, flow: Arc<Flow>) {
+fn write_blocks(mut pipe: impl Write, blocks: mpsc::Receiver<Vec<u8>>, flow: Arc<Flow>) {
     let mut written = 0usize;
     for block in blocks {
         let began = Instant::now();
@@ -302,25 +333,42 @@ pub enum Sent {
     /// Left out: ffmpeg has not begun to read, and its sound starts when
     /// it does, not when we began to wait for it.
     NotReadingYet,
-    /// Left out: ffmpeg has stopped taking the sound.
+    /// Left out: ffmpeg has stopped taking the sound. Silence is owed for it.
     Stuck,
+    /// Left out, with silence on its way in its place: what was owed is
+    /// being made up for, and sound is passed on again once it is.
+    CatchingUp,
 }
 
 /// Where the mixer writes: the current ffmpeg's stdin, through a thread
 /// that waits for ffmpeg so the mixer never does. The recorder puts a new
 /// pipe here each time it starts ffmpeg.
-#[derive(Default)]
 pub struct Sink {
     writer: Option<Writer>,
+    /// Bytes in one frame of the stream: silence is made of whole frames.
+    frame: usize,
+}
+
+impl Default for Sink {
+    fn default() -> Self {
+        Self::for_tracks(1)
+    }
 }
 
 impl Sink {
-    pub fn connect(&mut self, pipe: ChildStdin) {
+    /// The sink of a stream of `tracks` tracks.
+    pub fn for_tracks(tracks: usize) -> Self {
+        Self { writer: None, frame: tracks.max(1) * CHANNELS * 4 }
+    }
+
+    /// Write to `pipe` from now on: ffmpeg's stdin. What was owed to the
+    /// ffmpeg before is forgotten, as this one counts from its own start.
+    pub fn connect(&mut self, pipe: impl Write + Send + 'static) {
         let (blocks, incoming) = mpsc::channel();
         let flow = Arc::new(Flow::default());
         let theirs = flow.clone();
         std::thread::spawn(move || write_blocks(pipe, incoming, theirs));
-        self.writer = Some(Writer { blocks, flow });
+        self.writer = Some(Writer { blocks, flow, owed: 0, fell_behind: false });
     }
 
     /// Let go of the pipe: its thread closes it once it is not in a write.
@@ -333,39 +381,105 @@ impl Sink {
         self.writer.as_ref().is_some_and(|writer| writer.flow.reading.load(Ordering::Relaxed))
     }
 
+    /// Bytes of silence owed to the ffmpeg connected now.
+    pub fn owed(&self) -> usize {
+        self.writer.as_ref().map_or(0, |writer| writer.owed)
+    }
+
+    /// Whether the ffmpeg connected now is owed more sound than is worth
+    /// making up for: it is to be started afresh.
+    pub fn fell_behind(&self) -> bool {
+        self.writer.as_ref().is_some_and(|writer| writer.fell_behind)
+    }
+
+    /// `bytes` of sound were never made, for time that passed all the same
+    /// (the clock skipped it): owed as silence to an ffmpeg that is
+    /// reading, whose count of samples is its clock. One that has not
+    /// begun to read is owed nothing: its sound starts when it does.
+    pub fn owe(&mut self, bytes: usize) {
+        if let Some(writer) = &mut self.writer
+            && writer.flow.reading.load(Ordering::Relaxed)
+        {
+            writer.owed += bytes;
+        }
+    }
+
     /// Hand `block` over, unless it is to be left out; never waits.
-    /// `limit` is how many bytes may be waiting for ffmpeg.
+    /// `limit` is how many bytes may be waiting for ffmpeg. What is left
+    /// out of an ffmpeg that is reading is owed to it, and paid in silence
+    /// before any more sound: every byte it is due it gets, as one or the
+    /// other, so its count of samples keeps to the clock.
     pub fn send(&mut self, block: &[u8], limit: usize) -> Sent {
-        let Some(writer) = &self.writer else { return Sent::Nowhere };
-        if writer.flow.broken.load(Ordering::Relaxed) {
+        let sent = self.writer.as_mut().map_or(Sent::Nowhere, |writer| writer.send(block, limit, self.frame));
+        if sent == Sent::Nowhere {
             self.writer = None;
+        }
+        sent
+    }
+}
+
+impl Writer {
+    /// Put `bytes` on the way to ffmpeg. `false` when its thread is gone.
+    fn pass(&self, bytes: Vec<u8>) -> bool {
+        self.flow.waiting.fetch_add(bytes.len(), Ordering::Relaxed);
+        self.blocks.send(bytes).is_ok()
+    }
+
+    fn send(&mut self, block: &[u8], limit: usize, frame: usize) -> Sent {
+        if self.flow.broken.load(Ordering::Relaxed) {
             return Sent::Nowhere;
         }
         if block.is_empty() {
             return Sent::Passed;
         }
-        let waiting = writer.flow.waiting.load(Ordering::Relaxed);
-        if !writer.flow.reading.load(Ordering::Relaxed) {
+        let waiting = self.flow.waiting.load(Ordering::Relaxed);
+        if !self.flow.reading.load(Ordering::Relaxed) {
             // One block at a time until it reads, so that what it finds
             // when it begins is from that moment.
             if waiting > 0 {
                 return Sent::NotReadingYet;
             }
-        } else if waiting + block.len() > limit {
+            return if self.pass(block.to_vec()) { Sent::Passed } else { Sent::Nowhere };
+        }
+        if waiting + block.len() > limit {
+            self.owe(block.len(), limit);
             return Sent::Stuck;
-        } else {
-            let stale = writer.flow.stale.load(Ordering::Relaxed);
-            if stale > 0 {
-                writer.flow.stale.store(stale.saturating_sub(block.len()), Ordering::Relaxed);
-                return Sent::NotReadingYet;
+        }
+        let stale = self.flow.stale.load(Ordering::Relaxed);
+        if stale > 0 {
+            self.flow.stale.store(stale.saturating_sub(block.len()), Ordering::Relaxed);
+            return Sent::NotReadingYet;
+        }
+        // Less than a frame is not owed: only blocks of whole frames are.
+        if self.owed < frame {
+            self.owed = 0;
+            return if self.pass(block.to_vec()) { Sent::Passed } else { Sent::Nowhere };
+        }
+        // Silence first, as much as there is room for and no more than a
+        // share at a time: it stands where the sound left out would have.
+        let pay = self.owed.min(limit - waiting).min((limit / SILENCE_SHARE).max(frame));
+        let pay = pay - pay % frame;
+        if pay > 0 {
+            if !self.pass(vec![0; pay]) {
+                return Sent::Nowhere;
             }
+            self.owed -= pay;
         }
-        writer.flow.waiting.fetch_add(block.len(), Ordering::Relaxed);
-        if writer.blocks.send(block.to_vec()).is_err() {
-            self.writer = None;
-            return Sent::Nowhere;
+        if self.owed < frame && waiting + pay + block.len() <= limit {
+            self.owed = 0;
+            return if self.pass(block.to_vec()) { Sent::Passed } else { Sent::Nowhere };
         }
-        Sent::Passed
+        // Still owing: this block's moment comes before the silence is all
+        // written, so it would be heard too early. It is owed as well.
+        self.owe(block.len(), limit);
+        Sent::CatchingUp
+    }
+
+    fn owe(&mut self, bytes: usize, limit: usize) {
+        self.owed += bytes;
+        if self.owed > limit.saturating_mul(MAX_OWED) {
+            self.fell_behind = true;
+        }
     }
 }
 
@@ -375,6 +489,21 @@ const REPORT_EVERY: Duration = Duration::from_secs(10);
 /// Mix until `stop` is set. `make_sources` is called here, on the mixer's
 /// own thread, because the Windows sound interfaces must be used on the
 /// thread that opened them.
+/// One wake-up of the mixer at `elapsed` since its start: make what is
+/// due and hand it to the sink, with what the clock skipped owed to it as
+/// silence first.
+fn hand_over(mixer: &mut Mixer, sink: &Mutex<Sink>, elapsed: Duration, limit: usize) -> Sent {
+    mixer.tick(elapsed);
+    let skipped = mixer.take_skipped() as usize * mixer.frame_bytes();
+    if skipped > 0 {
+        crate::note!("sound: the clock ran {} ms ahead of the mixer; silence stands in for that time", skipped / (mixer.bytes_a_second() / 1000).max(1));
+    }
+    sink.lock().map_or(Sent::Nowhere, |mut sink| {
+        sink.owe(skipped);
+        sink.send(&mixer.block, limit)
+    })
+}
+
 pub fn run(make_sources: impl FnOnce() -> Vec<Box<dyn Source>>, sink: Arc<Mutex<Sink>>, stop: Arc<AtomicBool>) {
     // A game takes every processor it can; the sound must still be read on time.
     crate::sys::prefer_this_thread();
@@ -386,18 +515,20 @@ pub fn run(make_sources: impl FnOnce() -> Vec<Box<dyn Source>>, sink: Arc<Mutex<
     let mut left_out: Option<(Instant, Sent)> = None;
     while !stop.load(Ordering::Relaxed) {
         std::thread::sleep(TICK);
-        let block = mixer.tick(start.elapsed());
-        let sent = sink.lock().map_or(Sent::Nowhere, |mut sink| sink.send(block, limit));
+        let sent = hand_over(&mut mixer, &sink, start.elapsed(), limit);
         match (sent, left_out) {
-            (Sent::NotReadingYet | Sent::Stuck, None) => {
+            (Sent::NotReadingYet | Sent::Stuck | Sent::CatchingUp, None) => {
                 if sent == Sent::Stuck {
-                    crate::note!("sound: ffmpeg has not taken any for {MAX_WAITING_SECS} s; it is left out until it does");
+                    crate::note!("sound: ffmpeg has not taken any for {MAX_WAITING_SECS} s; it is left out until it does, and silence put in its place then");
                 }
                 left_out = Some((Instant::now(), sent));
             }
             (Sent::Passed, Some((since, why))) => {
-                let what = if why == Sent::Stuck { "took the sound again" } else { "began reading" };
-                crate::note!("sound: ffmpeg {what}; {} ms of waiting left out", since.elapsed().as_millis());
+                if why == Sent::NotReadingYet {
+                    crate::note!("sound: ffmpeg began reading; {} ms of waiting left out", since.elapsed().as_millis());
+                } else {
+                    crate::note!("sound: ffmpeg has all it was owed again; {} ms of sound were left out and are silence", since.elapsed().as_millis());
+                }
                 left_out = None;
             }
             (Sent::Nowhere, Some(_)) => left_out = None,
@@ -418,6 +549,7 @@ pub fn run(make_sources: impl FnOnce() -> Vec<Box<dyn Source>>, sink: Arc<Mutex<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::ChildStdin;
     use std::sync::mpsc;
 
     fn ms(n: u64) -> Duration {
@@ -754,6 +886,159 @@ mod tests {
         let out = reader.wait_with_output().unwrap();
         let said = String::from_utf8_lossy(&out.stdout);
         assert!(said.contains(", the first 1"), "{said}");
+    }
+
+    /// Stands in for ffmpeg's stdin: counts what it is given, and takes
+    /// nothing while it is `held`.
+    #[derive(Clone, Default)]
+    struct Taker {
+        held: Arc<AtomicBool>,
+        got: Arc<AtomicUsize>,
+        silent: Arc<AtomicUsize>,
+    }
+
+    impl Write for Taker {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            while self.held.load(Ordering::Relaxed) {
+                std::thread::sleep(ms(1));
+            }
+            if bytes.iter().all(|&b| b == 0) {
+                self.silent.fetch_add(bytes.len(), Ordering::Relaxed);
+            }
+            self.got.fetch_add(bytes.len(), Ordering::Relaxed);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A sink of one track whose ffmpeg is a [`Taker`] that reads already.
+    fn taken(taker: &Taker) -> Sink {
+        let mut sink = Sink::for_tracks(1);
+        sink.connect(taker.clone());
+        sink.writer.as_ref().unwrap().flow.reading.store(true, Ordering::Relaxed);
+        sink
+    }
+
+    fn waiting(sink: &Sink) -> usize {
+        sink.writer.as_ref().unwrap().flow.waiting.load(Ordering::Relaxed)
+    }
+
+    #[test]
+    fn what_ffmpeg_did_not_take_while_it_was_stuck_is_made_up_with_silence() {
+        let taker = Taker::default();
+        let mut sink = taken(&taker);
+        // 10 ms of one track at a wake-up; two seconds of it may wait.
+        let block = vec![1u8; 480 * 8];
+        let limit = 2 * 48_000 * 8;
+        let mut offered = 0;
+        let mut wake = |sink: &mut Sink| {
+            offered += block.len();
+            sink.send(&block, limit)
+        };
+        for _ in 0..100 {
+            assert_eq!(wake(&mut sink), Sent::Passed);
+        }
+        while waiting(&sink) > 0 {
+            std::thread::sleep(ms(1));
+        }
+        // Five seconds in which ffmpeg reads nothing: two of them wait for
+        // it, the rest is left out.
+        taker.held.store(true, Ordering::Relaxed);
+        let stuck = (0..500).filter(|_| wake(&mut sink) == Sent::Stuck).count();
+        assert!((299..=301).contains(&stuck), "{stuck} blocks were left out");
+        assert!(sink.owed() >= stuck * block.len());
+        assert!(waiting(&sink) <= limit, "what waits is never more than may");
+        // It reads again: silence first, in pieces, and only then sound.
+        taker.held.store(false, Ordering::Relaxed);
+        let began = Instant::now();
+        let mut catching_up = 0;
+        loop {
+            assert!(began.elapsed() < Duration::from_secs(20), "what was owed was never paid: {} bytes", sink.owed());
+            let sent = wake(&mut sink);
+            assert!(waiting(&sink) <= limit);
+            // Left out again when the silence filled all the room there was.
+            catching_up += usize::from(sent != Sent::Passed);
+            std::thread::sleep(ms(1));
+            if sent == Sent::Passed && sink.owed() == 0 && waiting(&sink) == 0 {
+                break;
+            }
+        }
+        assert!(catching_up > 0, "no sound is passed on before the silence it comes after");
+        // Every byte the time asked for was written, as sound or as silence.
+        assert_eq!(taker.got.load(Ordering::Relaxed), offered);
+        assert_eq!(taker.silent.load(Ordering::Relaxed), (stuck + catching_up) * block.len());
+        assert!(!sink.fell_behind());
+    }
+
+    #[test]
+    fn time_the_clock_skipped_is_made_up_with_silence() {
+        let taker = Taker::default();
+        let sink = Mutex::new(taken(&taker));
+        let (_never, silent) = mpsc::channel();
+        let mut mixer = Mixer::new(vec![fed(silent)]);
+        let limit = mixer.bytes_a_second() * MAX_WAITING_SECS;
+        let mut now = 0;
+        for _ in 0..100 {
+            now += 10;
+            assert_eq!(hand_over(&mut mixer, &sink, ms(now), limit), Sent::Passed);
+        }
+        // Five seconds without a wake-up (the machine slept): the mixer
+        // makes no sound for them, and ffmpeg is owed them all the same.
+        now += 5000;
+        assert_eq!(hand_over(&mut mixer, &sink, ms(now), limit), Sent::CatchingUp);
+        let began = Instant::now();
+        loop {
+            assert!(began.elapsed() < Duration::from_secs(20), "what was owed was never paid");
+            now += 10;
+            let sent = hand_over(&mut mixer, &sink, ms(now), limit);
+            std::thread::sleep(ms(1));
+            let sink = sink.lock().unwrap();
+            if sent == Sent::Passed && sink.owed() == 0 && waiting(&sink) == 0 {
+                break;
+            }
+        }
+        // What was written is what the time since the start asks for.
+        let written = taker.got.load(Ordering::Relaxed) / mixer.frame_bytes();
+        let due = Pacer::target(ms(now)) as usize;
+        assert!(written.abs_diff(due) <= 480, "{written} frames written, {due} due");
+        assert!(mixer.pacer.skipped() > 4 * 48_000);
+    }
+
+    #[test]
+    fn an_ffmpeg_that_has_not_begun_to_read_is_owed_nothing() {
+        let taker = Taker::default();
+        taker.held.store(true, Ordering::Relaxed);
+        let mut sink = Sink::for_tracks(1);
+        sink.connect(taker.clone());
+        assert_eq!(sink.send(&[1; 3840], 1 << 20), Sent::Passed);
+        assert_eq!(sink.send(&[1; 3840], 1 << 20), Sent::NotReadingYet);
+        sink.owe(48_000 * 8);
+        assert_eq!(sink.owed(), 0, "its sound starts when it does");
+        // Nor is the next one owed what the last was.
+        let mut sink = taken(&taker);
+        assert_eq!(sink.send(&[1; 3840], 3840), Sent::Passed);
+        assert_eq!(sink.send(&[1; 3840], 3840), Sent::Stuck);
+        assert_eq!(sink.owed(), 3840);
+        sink.connect(Taker::default());
+        assert_eq!(sink.owed(), 0);
+    }
+
+    #[test]
+    fn owing_more_than_can_be_made_up_for_is_told() {
+        let taker = Taker::default();
+        taker.held.store(true, Ordering::Relaxed);
+        let mut sink = taken(&taker);
+        let limit = 3840;
+        sink.send(&[1; 3840], limit);
+        for _ in 0..MAX_OWED {
+            assert_eq!(sink.send(&[1; 3840], limit), Sent::Stuck);
+            assert!(!sink.fell_behind());
+        }
+        assert_eq!(sink.send(&[1; 3840], limit), Sent::Stuck);
+        assert!(sink.fell_behind(), "half a minute owed: that ffmpeg is started afresh");
+        taker.held.store(false, Ordering::Relaxed);
     }
 
     #[test]

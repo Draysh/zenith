@@ -27,6 +27,17 @@ pub fn way_from_line(line: &str) -> Option<String> {
     (!way.is_empty()).then(|| way.to_string())
 }
 
+/// How the recorder's line on stdout begins that says a clip could not be
+/// saved, in place of the clip's path (`zenith-rec` prints it).
+pub const SAVE_FAILED: &str = "save-failed: ";
+
+/// Why a clip could not be saved, from the line the recorder printed in
+/// place of its path.
+pub fn save_failure_from_line(line: &str) -> Option<String> {
+    let why = line.trim().strip_prefix(SAVE_FAILED.trim_end())?.trim();
+    Some(if why.is_empty() { "the recorder could not write the clip".into() } else { why.to_string() })
+}
+
 /// Whether a way of recording is one of the fallbacks: copying the
 /// desktop's pixels, or encoding on the processor. Both work, and both
 /// cost the game more than the graphics card's own way.
@@ -44,6 +55,13 @@ mod tests {
         assert_eq!(way_from_line(line).as_deref(), Some("ddagrab -> h264_nvenc (frames kept on the GPU)"));
         assert_eq!(way_from_line("ffmpeg version 9"), None);
         assert_eq!(way_from_line("recording with "), None);
+    }
+
+    #[test]
+    fn a_clip_that_could_not_be_saved_says_why() {
+        assert_eq!(save_failure_from_line("save-failed: no room on the disk\n").as_deref(), Some("no room on the disk"));
+        assert_eq!(save_failure_from_line("save-failed:").as_deref(), Some("the recorder could not write the clip"));
+        assert_eq!(save_failure_from_line("C:\\Clips\\Replay.mp4"), None);
     }
 
     #[test]

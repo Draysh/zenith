@@ -105,6 +105,9 @@ jobs:
       - name: Lints
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Tests
+        env:
+          # A green run means the tests that need ffmpeg ran.
+          ZENITH_REQUIRE_FFMPEG: "1"
         run: cargo test --locked --workspace
       - name: Build
         run: ./dist/release/build-linux.sh
@@ -151,13 +154,17 @@ jobs:
           gh release download "$TAG" --repo "$RELEASES" --dir out
           ./dist/release/notes.sh "$TAG" > out/notes.md
           ls -la out
+      # Built before the key is handed over: what is compiled on the way
+      # (every dependency's build script) never sees it.
+      - name: The signing program
+        run: cargo build --locked --release -p zenith-sign
       - name: Sign
         env:
           ZENITH_SIGNING_KEY: ${{ secrets.ZENITH_SIGNING_KEY }}
           ZENITH_SIGNING_PASSWORD: ${{ secrets.ZENITH_SIGNING_PASSWORD }}
         run: |
-          cargo run --locked --release -p zenith-sign -- manifest "${TAG#v}" out/notes.md out
-          cargo run --locked --release -p zenith-sign -- sign out/*.tar.gz out/*-setup.exe out/latest.json
+          ./target/release/zenith-sign manifest "${TAG#v}" out/notes.md out
+          ./target/release/zenith-sign sign out/*.tar.gz out/*-setup.exe out/latest.json
       - name: Publish
         env:
           GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}

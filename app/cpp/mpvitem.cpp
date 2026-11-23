@@ -15,14 +15,27 @@
 #include <mpv/render_gl.h>
 
 // The player and its drawing context, shared by the item (GUI thread) and
-// its renderer (render thread). Everything in it is touched under `lock`;
-// the item clears it all when it goes, and the renderer then draws nothing.
+// its renderer (render thread). Everything in it is touched under `lock`.
+//
+// The drawing context is the renderer's to free: mpv wants that done where
+// the OpenGL context it was made in is current, which is the render thread,
+// and the player must still be there when it is. So whichever of the two
+// goes last ends the player:
+//  - the renderer first (or none ever made): it frees the drawing context,
+//    if it made one, and the item ends the player when it goes;
+//  - the item first, with a drawing context still there: it leaves the
+//    player behind (`orphaned`), and the renderer frees the context and
+//    then ends the player;
+//  - the item first, with no drawing context: it ends the player itself,
+//    and a renderer that comes or goes after finds nothing to do.
 struct MpvShared
 {
   QMutex lock;
   MpvItem* item = nullptr;
   mpv_handle* mpv = nullptr;
   mpv_render_context* gl = nullptr;
+  // The item is gone and has left `mpv` to the renderer to end.
+  bool orphaned = false;
 };
 
 namespace {
@@ -38,10 +51,26 @@ class MpvRenderer : public QQuickFramebufferObject::Renderer
 public:
   explicit MpvRenderer(std::shared_ptr<MpvShared> shared) : m_shared(std::move(shared)) {}
 
+  // Qt destroys a renderer on the render thread with the OpenGL context
+  // current: the one place the drawing context may be freed.
+  ~MpvRenderer() override
+  {
+    QMutexLocker held(&m_shared->lock);
+    if (m_shared->gl) {
+      mpv_render_context_free(m_shared->gl);
+      m_shared->gl = nullptr;
+    }
+    // The item went before: the player was left for here, after its context.
+    if (m_shared->orphaned && m_shared->mpv) {
+      mpv_terminate_destroy(m_shared->mpv);
+      m_shared->mpv = nullptr;
+    }
+  }
+
   QOpenGLFramebufferObject* createFramebufferObject(const QSize& size) override
   {
     QMutexLocker held(&m_shared->lock);
-    if (m_shared->mpv && !m_shared->gl) {
+    if (m_shared->mpv && m_shared->item && !m_shared->gl) {
       mpv_opengl_init_params gl{ procAddress, nullptr };
       // The display, so mpv can hand decoded frames to the GPU without a copy.
       mpv_render_param display{ MPV_RENDER_PARAM_INVALID, nullptr };
@@ -162,18 +191,28 @@ MpvItem::MpvItem(QQuickItem* parent) : QQuickFramebufferObject(parent), m_shared
 
 MpvItem::~MpvItem()
 {
-  // Under the lock: a frame being drawn finishes first, and none starts after.
+  // Under the lock: a frame being drawn finishes first, and the renderer
+  // does not go at the same moment.
   QMutexLocker held(&m_shared->lock);
   m_shared->item = nullptr;
-  m_shared->mpv = nullptr;
-  if (m_shared->gl) {
-    mpv_render_context_free(m_shared->gl);
-    m_shared->gl = nullptr;
+  if (!m_mpv) {
+    return;
   }
-  if (m_mpv) {
-    mpv_set_wakeup_callback(m_mpv, nullptr, nullptr);
+  // Nothing of mpv's calls this item from here on.
+  mpv_set_wakeup_callback(m_mpv, nullptr, nullptr);
+  if (m_shared->gl) {
+    // The drawing context can only be freed on the render thread, and the
+    // player must outlive it: both are the renderer's to end now (see
+    // `MpvShared`). Until it does, nothing plays and nothing is heard.
+    mpv_render_context_set_update_callback(m_shared->gl, nullptr, nullptr);
+    const char* stop[] = { "stop", nullptr };
+    mpv_command_async(m_mpv, 0, stop);
+    m_shared->orphaned = true;
+  } else {
+    m_shared->mpv = nullptr;
     mpv_terminate_destroy(m_mpv);
   }
+  m_mpv = nullptr;
 }
 
 QQuickFramebufferObject::Renderer* MpvItem::createRenderer() const
@@ -236,9 +275,15 @@ void MpvItem::renderFailed()
   emit failed(QStringLiteral("the picture could not be drawn (no OpenGL)"));
 }
 
+// Also after a renderer went and another came (the window let go of its
+// graphics): freeing the drawing context ended the picture of the file
+// that was open, so it is opened again.
 void MpvItem::renderReady()
 {
-  m_canDraw = true;
+  if (!m_canDraw) {
+    m_canDraw = true;
+    emit canDrawChanged();
+  }
   load();
 }
 

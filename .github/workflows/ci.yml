@@ -39,6 +39,9 @@ jobs:
           restore-keys: linux-cargo-
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo test --locked --workspace
+        env:
+          # A green run means the tests that need ffmpeg ran.
+          ZENITH_REQUIRE_FFMPEG: "1"
       # Kept when the checks are run on main itself, as a release keeps it.
       - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         if: github.ref == 'refs/heads/main'

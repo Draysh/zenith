@@ -51,9 +51,11 @@ pub mod ffi {
         /// Fetch the new version and put it in place of this one.
         #[qinvokable]
         fn install(self: Pin<&mut Updates>);
-        /// Start the version that was put in place. The app quits after.
+        /// Start the version that was put in place. Returns why it could
+        /// not be, empty when it was: only then is the app to quit, for the
+        /// new version to take its place.
         #[qinvokable]
-        fn restart(self: &Updates);
+        fn restart(self: &Updates) -> QString;
         /// This version has run for a while: a trial of it is over.
         #[qinvokable]
         fn started_well(self: &Updates);
@@ -80,16 +82,43 @@ enum State {
     Failed(String),
 }
 
-/// Fetch `url`, at most `limit` bytes of it, telling `seen` how far it is.
-fn fetch(url: &str, limit: u64, mut seen: impl FnMut(u64, Option<u64>)) -> Result<Vec<u8>, String> {
-    let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(30 * 60))).build().into();
-    let mut response = agent.get(url).call().map_err(|e| format!("{url} could not be fetched: {e}"))?;
+/// How long a whole release may take to come: it is large, and the line
+/// may be slow.
+const DOWNLOAD: Duration = Duration::from_secs(30 * 60);
+/// How long the small files may take (what the newest version is, and the
+/// signatures): a server that does not answer is given up on, so that
+/// looking for a new version comes to an end.
+const SMALL: Duration = Duration::from_secs(20);
+
+/// Why a fetch came to nothing.
+enum Unfetched {
+    /// The server has no such file (404).
+    Missing(String),
+    Failed(String),
+}
+
+impl Unfetched {
+    fn words(self) -> String {
+        match self {
+            Unfetched::Missing(why) | Unfetched::Failed(why) => why,
+        }
+    }
+}
+
+/// Fetch `url`, at most `limit` bytes of it and within `within`, telling
+/// `seen` how far it is.
+fn fetch(url: &str, limit: u64, within: Duration, mut seen: impl FnMut(u64, Option<u64>)) -> Result<Vec<u8>, Unfetched> {
+    let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(within)).build().into();
+    let mut response = agent.get(url).call().map_err(|e| {
+        let why = format!("{url} could not be fetched: {e}");
+        if matches!(e, ureq::Error::StatusCode(404)) { Unfetched::Missing(why) } else { Unfetched::Failed(why) }
+    })?;
     let total = response.body().content_length();
     let mut reader = response.body_mut().with_config().limit(limit).reader();
     let mut bytes = Vec::with_capacity(total.unwrap_or(0).min(limit) as usize);
     let mut chunk = [0u8; 64 * 1024];
     loop {
-        let n = reader.read(&mut chunk).map_err(|e| format!("the download stopped: {e}"))?;
+        let n = reader.read(&mut chunk).map_err(|e| Unfetched::Failed(format!("the download stopped: {e}")))?;
         if n == 0 {
             break;
         }
@@ -99,8 +128,8 @@ fn fetch(url: &str, limit: u64, mut seen: impl FnMut(u64, Option<u64>)) -> Resul
     Ok(bytes)
 }
 
-fn text(url: &str) -> Result<String, String> {
-    String::from_utf8(fetch(url, 1024 * 1024, |_, _| {})?).map_err(|_| format!("{url} is not text"))
+fn text(url: &str) -> Result<String, Unfetched> {
+    String::from_utf8(fetch(url, 1024 * 1024, SMALL, |_, _| {})?).map_err(|_| Unfetched::Failed(format!("{url} is not text")))
 }
 
 /// What the newest release offers this copy, if anything.
@@ -108,10 +137,10 @@ fn look() -> Result<Option<(Manifest, File)>, String> {
     let manifest = match text(&update::url(update::MANIFEST)) {
         Ok(manifest) => manifest,
         // Nothing has been released yet: there is nothing newer.
-        Err(why) if why.ends_with("http status: 404") => return Ok(None),
-        Err(why) => return Err(why),
+        Err(Unfetched::Missing(_)) => return Ok(None),
+        Err(why) => return Err(why.words()),
     };
-    let signature = text(&update::url(&format!("{}.minisig", update::MANIFEST)))?;
+    let signature = text(&update::url(&format!("{}.minisig", update::MANIFEST))).map_err(Unfetched::words)?;
     update::offer(KEYS, &manifest, &signature, VERSION).map_err(|e| e.to_string())
 }
 
@@ -208,7 +237,7 @@ impl ffi::Updates {
             return;
         }
         if !asked {
-            let allowed = Config::load(&paths::config_file()).map(|c| c.updates.check).unwrap_or(true);
+            let allowed = Config::load_usable(&paths::config_file()).updates.check;
             if !allowed || install::here() == Here::Development || !update::has_key(KEYS) {
                 return;
             }
@@ -251,15 +280,16 @@ impl ffi::Updates {
                 // is part of what was signed), and a release is a few
                 // hundred megabytes at the very most.
                 let most = if file.size > 0 { file.size.saturating_add(1024 * 1024) } else { u64::MAX };
-                let bytes = fetch(&update::url(&file.name), most.min(2 * 1024 * 1024 * 1024), |have, total| {
+                let bytes = fetch(&update::url(&file.name), most.min(2 * 1024 * 1024 * 1024), DOWNLOAD, |have, total| {
                     let total = total.unwrap_or(file.size).max(1);
                     let percent = have * 100 / total;
                     if percent != last {
                         last = percent;
                         let _ = progress.queue(move |updates| updates.set(State::Downloading((percent as f64 / 100.0).min(1.0))));
                     }
-                })?;
-                let signature = text(&update::url(&format!("{}.minisig", file.name)))?;
+                })
+                .map_err(Unfetched::words)?;
+                let signature = text(&update::url(&format!("{}.minisig", file.name))).map_err(Unfetched::words)?;
                 update::verify(KEYS, &signature, &file.name, &bytes).map_err(|e| e.to_string())?;
                 put_in_place(&dir, &file, &bytes, &signature, &manifest.version)
             })();
@@ -281,13 +311,18 @@ impl ffi::Updates {
     /// of the recorder program kept elsewhere. Where the copy cannot be
     /// made or started, the setup program is run as before.
     #[cfg(windows)]
-    fn restart(&self) {
+    fn restart(&self) -> QString {
+        QString::from(&self.start_new().err().unwrap_or_default())
+    }
+
+    #[cfg(windows)]
+    fn start_new(&self) -> Result<(), String> {
         use std::os::windows::process::CommandExt;
         // Only what was fetched and checked in this run is ever started.
         if self.rust().state != State::Ready {
-            return;
+            return Err("There is no new version in place to start.".into());
         }
-        let Some((manifest, file)) = self.rust().offer.clone() else { return };
+        let Some((manifest, file)) = self.rust().offer.clone() else { return Err("There is no new version in place to start.".into()) };
         let setup = setup_file(&file);
         // It has lain there since it was fetched: it is run only if it
         // still is the file that was signed.
@@ -297,7 +332,7 @@ impl ffi::Updates {
             .and_then(|(bytes, signature)| update::verify(KEYS, &signature, &file.name, &bytes).map_err(|e| e.to_string()));
         if let Err(why) = still_ours {
             eprintln!("zenith-clips: the update is not run: {why}");
-            return;
+            return Err(format!("The update was not started: the file fetched for it is not as it was ({why}). Look for the new version again."));
         }
         let styled = || -> std::io::Result<()> {
             let app = install::current_exe().ok_or_else(|| std::io::Error::other("where Zenith is installed is not known"))?;
@@ -325,17 +360,25 @@ impl ffi::Updates {
             eprintln!("zenith-clips: the update is shown by the setup program itself: {why}");
             std::process::Command::new(&setup).args(["/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART"]).spawn().map(|_| ())
         });
-        if let Err(e) = started {
+        started.map_err(|e| {
             eprintln!("zenith-clips: the new version could not be started: {e}");
-        }
+            format!("The new version could not be started: {e}")
+        })
     }
 
     #[cfg(not(windows))]
-    fn restart(&self) {
+    fn restart(&self) -> QString {
+        QString::from(&self.start_new().err().unwrap_or_default())
+    }
+
+    /// The new version is in place already: it is opened once this window
+    /// is gone.
+    #[cfg(not(windows))]
+    fn start_new(&self) -> Result<(), String> {
         if self.rust().state != State::Ready {
-            return;
+            return Err("There is no new version in place to start.".into());
         }
-        let Some(exe) = install::current_exe() else { return };
+        let Some(exe) = install::current_exe() else { return Err("The new version could not be started: where Zenith is installed is not known.".into()) };
         // The recorder is replaced too: have it start as the new one. Then,
         // once this window is gone, open the new one.
         let script = "systemctl --user try-restart zenithd.service 2>/dev/null; while kill -0 \"$1\" 2>/dev/null; do sleep 0.2; done; exec \"$2\"";
@@ -344,9 +387,10 @@ impl ffi::Updates {
             .arg(&exe)
             .stdin(std::process::Stdio::null())
             .spawn();
-        if let Err(e) = started {
+        started.map(|_| ()).map_err(|e| {
             eprintln!("zenith-clips: the new version could not be started: {e}");
-        }
+            format!("The new version could not be started: {e}. It runs from the next start.")
+        })
     }
 
     fn started_well(&self) {

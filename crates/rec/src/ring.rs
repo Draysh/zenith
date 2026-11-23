@@ -8,7 +8,7 @@ use std::path::Path;
 pub const PIECE_SECS: u32 = 1;
 /// Pieces kept beyond the buffer: the one being written, and room for a
 /// save to wait for it without the oldest piece being deleted meanwhile.
-const SPARE: usize = 3;
+pub const SPARE: usize = 3;
 
 /// What the pieces are made of. MPEG-TS needs no finishing, so a piece is
 /// whole even if ffmpeg is killed while writing it; it cannot hold AV1,

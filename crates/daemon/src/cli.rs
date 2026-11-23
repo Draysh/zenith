@@ -66,14 +66,25 @@ fn send(request: Request) -> ExitCode {
                 Some(false) => "off",
                 None => "auto",
             };
-            say(format_args!("state: {}{}", s.state, s.detail.map(|d| format!(" ({d})")).unwrap_or_default()));
+            say(format_args!("state: {}{}", s.state, s.detail.as_ref().map(|d| format!(" ({d})")).unwrap_or_default()));
             say(format_args!("game: {}", s.game.as_deref().unwrap_or("none")));
             say(format_args!("capture: {capture}"));
             if let Some(way) = &s.recording {
                 say(format_args!("recording: {way}"));
             }
+            match (&s.hotkey, &s.hotkey_missing) {
+                (Some(held), _) => say(format_args!("hotkey: {held}")),
+                (None, Some(why)) => say(format_args!("hotkey: none; {why}. Bind `zenithd save` to a key yourself")),
+                (None, None) => {}
+            }
             say(format_args!("buffer: {} s", s.buffer_secs));
             say(format_args!("clips saved: {}", s.clips_saved));
+            // Left running across an update, most likely: it does what the
+            // version it is does, until it is started again.
+            if s.other_version(env!("CARGO_PKG_VERSION")) {
+                let theirs = if s.version.is_empty() { "an older version" } else { s.version.as_str() };
+                warn(format_args!("zenithd: the recorder that is running is {theirs}, not {}: stop it (zenithd quit) and start it again", env!("CARGO_PKG_VERSION")));
+            }
             ExitCode::SUCCESS
         }
         Ok(Response::Error { message }) => {
@@ -98,7 +109,7 @@ fn report() -> ExitCode {
     use zenith_core::doctor::{assess, gather};
     use zenith_core::recorder::outputs;
     use zenith_core::{install, report};
-    let cfg = Config::load(&paths::config_file()).unwrap_or_default();
+    let cfg = Config::load_usable(&paths::config_file());
     let program = std::env::var("ZENITH_RECORDER").unwrap_or_else(|_| recorder::PROGRAM.into());
     let checks = assess(&gather(&cfg, &program, &paths::socket()), &cfg);
     let status = match ipc::ask(&paths::socket(), &Request::Status, Duration::from_secs(2)) {
@@ -194,7 +205,11 @@ pub fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match runtime.block_on(daemon::run(opts)) {
+    let ran = runtime.block_on(daemon::run(opts));
+    // What was being done aside (a program asked something, a file read)
+    // gets a moment to end; one that hangs does not keep the daemon here.
+    runtime.shutdown_timeout(Duration::from_secs(5));
+    match ran {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             warn(format_args!("zenithd: {e}"));

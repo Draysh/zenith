@@ -179,7 +179,7 @@ impl ffi::Media {
     }
 
     fn waveform(self: Pin<&mut Self>, path: &QString, track: i32, buckets: i32) {
-        let job = Job::Waveform { path: PathBuf::from(path.to_string()), track: track.max(0) as u32, buckets: buckets.clamp(1, 4000) as usize };
+        let job = Job::Waveform { path: PathBuf::from(path.to_string()), track: track.max(0) as u32, buckets: buckets.clamp(1, 8000) as usize };
         self.submit(job);
     }
 }

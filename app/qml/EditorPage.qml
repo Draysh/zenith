@@ -150,6 +150,16 @@ FocusScope {
         holding = false
     }
     function toggleMute(track) { apply(Editor.setMuted(track, !edit.gains[track].muted)) }
+    // The sound a step later or earlier. Steps that follow one another (the
+    // wheel's notches, a key held down) are one step to undo and one write
+    // to the library, when they come to rest: until then only what is seen
+    // and heard follows, as with a volume slider.
+    function syncMove(ms) {
+        edit = JSON.parse(Editor.setAudioOffset(ms))
+        player.setAudioDelay((edit.audioOffsetMs || 0) / 1000)
+        syncRest.restart()
+    }
+    Timer { id: syncRest; interval: 600; onTriggered: page.apply(Editor.settle()) }
     // The part the playhead is in starts (or ends) where the playhead is:
     // what is before (or after) it in that part is cut away.
     function trimHere(start) {
@@ -241,7 +251,7 @@ FocusScope {
 
     focus: true
     // Closing with a handle still held: the drag ends as one undo step.
-    Component.onDestruction: if (Editor.held()) { Editor.release() }
+    Component.onDestruction: { if (Editor.held()) { Editor.release() } Editor.settle() }
     Component.onCompleted: {
         forceActiveFocus()
         if (edit.missing) {
@@ -406,6 +416,24 @@ FocusScope {
             }
             onEnded: paused = true
             onFailed: reason => page.say("This clip cannot be played: " + reason)
+        }
+        // The picture is drawn with OpenGL and nothing else. Where that
+        // does not start, the stage would stay black without a word: after
+        // a few seconds it says so. (It goes again should the picture come,
+        // as after a window that was opened minimised is shown.)
+        Timer { id: pictureWait; interval: 5000; running: !player.canDraw }
+        Text {
+            visible: !player.canDraw && !pictureWait.running
+            anchors.centerIn: parent
+            width: Math.min(parent.width - 48, 520)
+            horizontalAlignment: Text.AlignHCenter
+            wrapMode: Text.Wrap
+            text: "The picture could not be started. Zenith shows video with OpenGL, which this computer's graphics driver did not provide. The clip can still be exported."
+            // On black whatever the window's colour: light, always.
+            color: "#EEF4F6"
+            font.family: Theme.family
+            font.pixelSize: Theme.body
+            lineHeight: 1.3
         }
         MouseArea { anchors.fill: parent; onClicked: { page.forceActiveFocus(); page.togglePlay() } }
     }
@@ -670,7 +698,7 @@ FocusScope {
             onVolumeReleased: page.volumeRelease()
             onMuteToggled: track => page.toggleMute(track)
             // The keyboard stays on the sync while its keys move it.
-            onSyncMoved: ms => { if (!timeline.syncFocused) { page.forceActiveFocus() } page.apply(Editor.setAudioOffset(ms)) }
+            onSyncMoved: ms => { if (!timeline.syncFocused) { page.forceActiveFocus() } page.syncMove(ms) }
         }
     }
 

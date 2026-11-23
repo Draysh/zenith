@@ -103,6 +103,9 @@ jobs:
       # hand, on a real computer, with the build itself. The script that
       # did it is still there to run (dist/windows/smoke.ps1).
       - name: Tests
+        env:
+          # A green run means the tests that need ffmpeg ran.
+          ZENITH_REQUIRE_FFMPEG: "1"
         run: cargo test --locked -p zenith-core -p zenith-daemon -p zenith-rec --features zenith-core/bundled-sqlite
       - name: Into the release's draft
         if: inputs.release_tag != ''

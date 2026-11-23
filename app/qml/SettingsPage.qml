@@ -30,12 +30,18 @@ FocusScope {
     // What the recorder says about the clip key once it has tried to take
     // it: another program may hold the combination already.
     property string keyTrouble: ""
+    // On Linux the desktop holds the key for the recorder: the one it gave,
+    // and why there is none when it gave none.
+    property string keyHeld: ""
+    property string keyMissing: ""
     Timer { id: keyCheck; interval: 1500; onTriggered: Recorder.poll() }
     Connections {
         target: Recorder
         function onStatusReady(status) {
             const s = JSON.parse(status)
             page.keyTrouble = s.detail && /hotkey|key/i.test(s.detail) && s.state !== "failed" ? s.detail : ""
+            page.keyHeld = s.hotkey || ""
+            page.keyMissing = s.hotkeyMissing || ""
         }
     }
     // How things stand with new versions.
@@ -124,12 +130,19 @@ FocusScope {
 
     focus: true
     Keys.onEscapePressed: page.leave()
-    Component.onDestruction: if (saver.running) { save() }
+    Component.onDestruction: flush()
+    // A change still waiting to be saved is saved now: the page or the
+    // whole window is going.
+    function flush() {
+        if (saver.running) { saver.stop(); save() }
+    }
     // A dragged slider is one save, when it comes to rest.
     Timer { id: saver; interval: 500; onTriggered: page.save() }
 
     Item {
         id: header
+        // Everything under the sheet waits for it: no key or Tab reaches it.
+        enabled: !addGame.open
         height: 56
         width: parent.width
         IconButton {
@@ -155,6 +168,7 @@ FocusScope {
 
     Flickable {
         id: scroller
+        enabled: !addGame.open
         anchors.top: header.bottom
         anchors.bottom: parent.bottom
         width: parent.width
@@ -667,9 +681,24 @@ FocusScope {
             SettingGroup {
                 visible: Qt.platform.os !== "windows"
                 title: "Shortcut"
+                // The desktop is asked for the key, where it can be asked
+                // (it may show a question of its own, and may give another
+                // key than the one wanted).
+                SettingRow {
+                    label: "Clip key"
+                    note: linuxKey.problem !== "" ? linuxKey.problem
+                        : page.keyHeld !== "" ? "Your desktop holds " + page.keyHeld + " for Zenith: press it anywhere, in a game too, to save the last moments as a clip."
+                        : page.keyMissing !== "" ? "No key from your desktop: " + page.keyMissing + ". Use the command below instead."
+                        : "Zenith asks your desktop for this key. Where the desktop cannot give one, use the command below instead."
+                    KeyPicker {
+                        id: linuxKey
+                        value: page.cfg.capture.hotkey || "Alt+F9"
+                        onPicked: combination => { if (combination !== page.cfg.capture.hotkey) { page.set("capture", "hotkey", combination); keyCheck.restart() } }
+                    }
+                }
                 SettingRow {
                     label: "Clip shortcut"
-                    note: "Set in your desktop's own keyboard settings: bind a key to the command below."
+                    note: "Or set it in your desktop's own keyboard settings: bind a key to the command below."
                     stacked: true
                     Rectangle {
                         width: parent.width
@@ -723,7 +752,11 @@ FocusScope {
                             : page.up.state === "available" && page.up.here === "portable" ? "Update to " + page.up.latest
                             : "Check now"
                         onClicked: {
-                            if (page.up.state === "ready") { Updates.restart(); Qt.quit() }
+                            if (page.up.state === "ready") {
+                                // Zenith only closes when the new version was started.
+                                const why = Updates.restart()
+                                if (why === "") { page.flush(); Qt.quit() } else { page.say(why) }
+                            }
                             else if (page.up.state === "available" && page.up.here === "portable") { Updates.install() }
                             else { Updates.check(true) }
                         }
@@ -793,6 +826,8 @@ FocusScope {
         id: addGame
         title: "Add a game"
         panelWidth: 540
+        // What was under it had the keyboard taken from it: the page has it again.
+        onClosed: page.forceActiveFocus()
         // [{ program, title }]
         property var programs: []
         property string picked: ""

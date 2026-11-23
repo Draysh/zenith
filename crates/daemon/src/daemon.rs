@@ -10,7 +10,7 @@ use zenith_core::recorder::outputs;
 use zenith_core::config::{Activation, Config};
 use zenith_core::games::{DESKTOP, Game, Scanner, folder_name};
 use zenith_core::ipc::{Request, Response, Status};
-use zenith_core::library::{self, Library};
+use zenith_core::library::{self, Library, Meta};
 use zenith_core::paths;
 use zenith_core::recorder::supervisor::{Problem, save_timeout};
 use zenith_core::recorder::{self, Action, Event, State, Supervisor};
@@ -35,6 +35,12 @@ pub const GAME_GRACE: Duration = Duration::from_secs(30);
 /// A recorder that would not stay up is tried again this often, for as long
 /// as capture is wanted: what was wrong at login may have settled since.
 const RETRY_FAILED_EVERY: Duration = Duration::from_secs(120);
+/// How long ffprobe gets to read a clip that was just filed.
+const PROBE_WITHIN: Duration = Duration::from_secs(30);
+/// How long a clip that is being written or filed is waited for when the
+/// daemon is told to stop. Less than the minute and a half a service is
+/// given to stop in before it is killed.
+const FINISH_WITHIN: Duration = Duration::from_secs(60);
 
 pub struct Options {
     pub config: PathBuf,
@@ -65,10 +71,51 @@ pub enum Msg {
     #[cfg_attr(windows, allow(dead_code))]
     Reload,
     Shutdown,
+    /// A clip has been filed, or could not be.
+    Filed(Filed),
     /// How taking the save hotkey went: the combination now held, or what
-    /// is wrong with it. Only Windows has the daemon hold one.
-    #[cfg_attr(not(windows), allow(dead_code))]
+    /// is wrong with it, which the user is told. Windows holds one itself;
+    /// on Linux the desktop gives one, and only ever says it is held.
     Hotkey(Result<String, String>),
+    /// The desktop gives no save hotkey, and why (Linux). Not a fault:
+    /// `zenithd save` bound to a key by hand works without one.
+    #[cfg_attr(windows, allow(dead_code))]
+    NoHotkey(String),
+}
+
+/// A clip the recorder wrote, after the work of filing it, which is done
+/// aside: a clip folder on another disk makes it a copy of the whole file.
+pub struct Filed {
+    game: String,
+    target: PathBuf,
+    /// Why it could not be moved into the library; or, moved, what
+    /// reading it gave.
+    outcome: Result<Result<Meta, String>, String>,
+    /// Who asked for this clip.
+    waiting: Vec<oneshot::Sender<Response>>,
+}
+
+/// Move a clip the recorder wrote to its place in the library.
+fn move_clip(written: &Path, target: &Path) -> std::io::Result<()> {
+    if let Some(folder) = target.parent() {
+        std::fs::create_dir_all(folder)?;
+    }
+    // A clip folder moved to another disk mid-save cannot be renamed into.
+    std::fs::rename(written, target).or_else(|_| {
+        // Copied is saved, whether or not the first can be cleared
+        // away now (something may be reading it): that folder is
+        // emptied when the recorder next starts.
+        std::fs::copy(written, target).map(|_| {
+            let _ = std::fs::remove_file(written);
+        })
+    })
+}
+
+/// Answer those waiting on a save.
+fn tell(waiting: impl IntoIterator<Item = oneshot::Sender<Response>>, response: &Response) {
+    for waiting in waiting {
+        let _ = waiting.send(response.clone());
+    }
 }
 
 /// What the task that owns the recorder's process is asked to do with it.
@@ -102,6 +149,12 @@ struct Daemon {
     buffer_megabytes: u32,
     /// Where the running recorder writes, which new settings may move.
     incoming: Option<PathBuf>,
+    /// Clips being filed now, and the folders of before that are cleared
+    /// away once none is: one may still be copied out of them.
+    filing: u32,
+    stale: Vec<PathBuf>,
+    /// The settings that were not valid when last read, as the user was told.
+    ignored: Vec<String>,
     /// Capture switched on or off by hand, over what the settings say.
     forced: Option<bool>,
     child: Option<Child>,
@@ -111,12 +164,15 @@ struct Daemon {
     save_game: Option<String>,
     waiting: Vec<oneshot::Sender<Response>>,
     /// Who asked it to quit, answered once it has cleaned up.
-    quitting: Option<oneshot::Sender<Response>>,
+    quitting: Vec<oneshot::Sender<Response>>,
     library: Library,
     clips_saved: u32,
     hotkeys: Hotkeys,
     /// What is wrong with the save hotkey, while something is.
     hotkey_problem: Option<String>,
+    /// The save hotkey that is held, and why none is where none is.
+    hotkey_held: Option<String>,
+    hotkey_missing: Option<String>,
     /// How the recorder said it is recording, for the one running now.
     way: Option<String>,
     tx: mpsc::UnboundedSender<Msg>,
@@ -214,7 +270,7 @@ impl Daemon {
 
     async fn act(&mut self, action: Action) -> Option<Event> {
         match action {
-            Action::Spawn => self.spawn().err().map(Event::SpawnFailed),
+            Action::Spawn => self.spawn().await.err().map(Event::SpawnFailed),
             Action::Kill => {
                 self.stop_child().await;
                 None
@@ -253,6 +309,15 @@ impl Daemon {
                 self.file_clip(&path);
                 None
             }
+            Action::Report(Problem::RecorderUnsteady(why)) => {
+                // Nobody is waiting on this, and it goes on being restarted.
+                let detail = format!("The recorder stops after a short while, again and again. It is started again each time; clips may be missing. It last said: {why}");
+                log(format!("Capture keeps stopping: {detail}"));
+                if self.cfg.feedback.notification {
+                    feedback::problem("Capture keeps stopping", &detail);
+                }
+                None
+            }
             Action::Report(problem) => {
                 let gave_up = matches!(problem, Problem::RecorderFailed(_));
                 let (summary, detail) = match problem {
@@ -266,7 +331,7 @@ impl Daemon {
                         },
                     ),
                     Problem::SaveFailed(why) => ("The clip was not saved", why),
-                    Problem::RecorderFailed(why) => ("Capture stopped", why),
+                    Problem::RecorderFailed(why) | Problem::RecorderUnsteady(why) => ("Capture stopped", why),
                 };
                 log(format!("{summary}: {detail}"));
                 self.answer(Response::Error { message: format!("{summary}: {detail}") });
@@ -285,22 +350,34 @@ impl Daemon {
 
     /// Answer everyone waiting on a save.
     fn answer(&mut self, response: Response) {
-        for waiting in self.waiting.drain(..) {
-            let _ = waiting.send(response.clone());
-        }
+        tell(self.waiting.drain(..), &response);
     }
 
-    fn spawn(&mut self) -> Result<(), String> {
+    async fn spawn(&mut self) -> Result<(), String> {
         let dir = incoming(&self.cfg);
         // Anything left there is from a recorder that was killed mid-write;
-        // so is the folder of before the clip folder was changed.
-        if let Some(old) = self.incoming.replace(dir.clone()).filter(|old| *old != dir) {
-            let _ = std::fs::remove_dir_all(old);
+        // so is the folder of before the clip folder was changed. Unless a
+        // clip is being filed out of one of them right now: then they are
+        // left until it has been.
+        let old = self.incoming.replace(dir.clone()).filter(|old| *old != dir);
+        if self.filing == 0 {
+            if let Some(old) = old {
+                let _ = std::fs::remove_dir_all(old);
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        } else {
+            self.stale.extend(old);
         }
-        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).map_err(|e| format!("the clip folder {} cannot be written to: {e}", dir.display()))?;
 
-        let (source, native) = outputs::resolve(&self.cfg.capture.source, &outputs::list(&self.opts.recorder));
+        // Asking the recorder what is plugged in runs it and waits for it,
+        // which is done aside: requests are still taken and the timers
+        // still run meanwhile. Nothing else is decided until it answers,
+        // or has taken too long to (`outputs::ASK_WITHIN`).
+        let recorder = self.opts.recorder.clone();
+        let asked = tokio::task::spawn_blocking(move || (outputs::list(&recorder), outputs::audio_devices(&recorder))).await;
+        let (monitors, devices) = asked.unwrap_or_default();
+        let (source, native) = outputs::resolve(&self.cfg.capture.source, &monitors);
         let mut cfg = self.cfg.clone();
         cfg.capture.source = source;
         // Switched on by hand, there may be no game to wait for the
@@ -310,7 +387,6 @@ impl Daemon {
         }
         // A chosen speaker or microphone that is not plugged in now gives
         // way to the default one, instead of the recorder refusing to start.
-        let devices = outputs::audio_devices(&self.opts.recorder);
         for (chosen, default, what) in [
             (&mut cfg.audio.output_device, outputs::DEFAULT_OUTPUT, "output"),
             (&mut cfg.audio.input_device, outputs::DEFAULT_INPUT, "microphone"),
@@ -341,9 +417,10 @@ impl Daemon {
         // graphics card's own way. Zenith's recorder says, a moment on.
         self.way = cfg!(not(windows)).then(|| format!("gpu-screen-recorder -> {}", cfg.capture.codec.as_str()));
         log(format!("recorder started (pid {}): {} {}", link.pid(), self.opts.recorder, args.join(" ")));
+        crate::control::note_recorder(&self.opts.socket, link.pid());
 
         let tx = self.tx.clone();
-        tokio::spawn(each_line(stdout, move |line| {
+        let lines = tokio::spawn(each_line(stdout, move |line| {
             let _ = tx.send(Msg::Line { generation, line });
         }));
         // The last thing it said is the best account of why it stopped.
@@ -366,9 +443,16 @@ impl Daemon {
             loop {
                 tokio::select! {
                     status = child.wait() => {
-                        // A helper of its that lives on may hold the pipe open:
-                        // what it said so far has to do.
-                        let _ = tokio::time::timeout(Duration::from_millis(300), errors).await;
+                        // What it printed last is read by other tasks, and
+                        // must be handed on before the news that it ended:
+                        // a recorder may print a clip's path and end at
+                        // once. A helper of its that lives on may hold the
+                        // pipes open: what it said so far has to do.
+                        let _ = tokio::time::timeout(Duration::from_millis(300), async move {
+                            let _ = lines.await;
+                            let _ = errors.await;
+                        })
+                        .await;
                         let said = last_words.lock().unwrap_or_else(|e| e.into_inner()).clone();
                         let status = status.map_or_else(|e| e.to_string(), |s| s.to_string());
                         let detail = if said.is_empty() { status } else { format!("{said} ({status})") };
@@ -397,52 +481,129 @@ impl Daemon {
         if let Some(child) = self.child.take() {
             let _ = child.orders.send(Order::Stop);
             let _ = child.done.await;
+            crate::control::forget_recorder(&self.opts.socket);
             log("recorder stopped");
         }
     }
 
     /// File a clip the recorder wrote: under its game, into the library.
+    /// The moving and the reading are done aside and come back as
+    /// `Msg::Filed`; whoever asked for the clip is answered then.
     fn file_clip(&mut self, written: &Path) {
         let game = self.save_game.take().or_else(|| self.game_name()).unwrap_or_else(|| DESKTOP.into());
         let target = library::clip_path(&self.cfg.library.dir, &game, chrono::Local::now());
-        let filed = target
-            .parent()
-            .map_or(Ok(()), std::fs::create_dir_all)
-            // A clip folder moved to another disk mid-save cannot be renamed into.
-            .and_then(|_| std::fs::rename(written, &target).or_else(|_| {
-                // Copied is saved, whether or not the first can be cleared
-                // away now (something may be reading it): that folder is
-                // emptied when the recorder next starts.
-                std::fs::copy(written, &target).map(|_| {
-                    let _ = std::fs::remove_file(written);
-                })
-            }))
-            .map_err(|e| format!("it could not be moved to {}: {e}", target.display()))
-            .and_then(|_| library::probe(&target).map_err(|e| format!("{} was written but cannot be played: {e}", target.display())));
-        match filed {
+        let waiting = std::mem::take(&mut self.waiting);
+        // Within the clip folder, as nearly always, filing is a rename:
+        // done here and now, so that the name is taken before the next
+        // clip is given one.
+        let renamed = target.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|_| std::fs::rename(written, &target)).is_ok();
+        self.filing += 1;
+        let (tx, written) = (self.tx.clone(), written.to_path_buf());
+        tokio::spawn(async move {
+            let to = target.clone();
+            let moved = if renamed { Ok(()) } else { tokio::task::spawn_blocking(move || move_clip(&written, &to)).await.unwrap_or_else(|e| Err(std::io::Error::other(e))) };
+            let outcome = match moved {
+                Err(e) => Err(format!("it could not be moved to {}: {e}", target.display())),
+                Ok(()) => {
+                    let file = target.clone();
+                    let read = tokio::time::timeout(PROBE_WITHIN, tokio::task::spawn_blocking(move || library::probe(&file).map_err(|e| e.to_string()))).await;
+                    Ok(match read {
+                        Ok(Ok(read)) => read,
+                        Ok(Err(e)) => Err(e.to_string()),
+                        Err(_) => Err("ffprobe did not answer in time".to_string()),
+                    })
+                }
+            };
+            let _ = tx.send(Msg::Filed(Filed { game, target, outcome, waiting }));
+        });
+    }
+
+    /// Take in a clip that was filed: index it, and say so.
+    fn filed(&mut self, Filed { game, target, outcome, waiting }: Filed) {
+        self.filing = self.filing.saturating_sub(1);
+        if self.filing == 0 {
+            for old in std::mem::take(&mut self.stale) {
+                if self.incoming.as_ref() != Some(&old) {
+                    let _ = std::fs::remove_dir_all(old);
+                }
+            }
+        }
+        let read = match outcome {
+            Ok(read) => read,
+            Err(why) => {
+                log(format!("the clip was not saved: {why}"));
+                tell(waiting, &Response::Error { message: format!("The clip was not saved: {why}") });
+                if self.cfg.feedback.notification {
+                    feedback::problem("The clip was not saved", &why);
+                }
+                return;
+            }
+        };
+        // From here on the file is in the library's folder: the clip is
+        // saved, whatever else goes wrong.
+        match &read {
             Ok(meta) => {
                 let tracks: Vec<_> = recorder::tracks(&self.cfg).into_iter().map(|t| t.0).collect();
                 let saved_at = library::saved_at(&target);
-                if let Err(e) = self.library.add(&target, &folder_name(&game), saved_at, &meta, &tracks) {
+                if let Err(e) = self.library.add(&target, &folder_name(&game), saved_at, meta, &tracks) {
                     // The file is safe; the index is rebuilt from the folder.
                     log(format!("the clip is saved but not indexed: {e}"));
                 }
-                self.clips_saved += 1;
-                self.reported = None;
                 log(format!("clip saved: {} ({:.1} s)", target.display(), meta.seconds));
-                self.answer(Response::Saved { path: target.clone() });
-                if self.cfg.feedback.sound {
-                    feedback::play_saved();
-                }
-                if self.cfg.feedback.notification {
-                    feedback::clip_saved(&game, meta.seconds, &target);
-                }
             }
-            Err(why) => {
-                log(format!("the clip was not saved: {why}"));
-                self.answer(Response::Error { message: format!("The clip was not saved: {why}") });
-                if self.cfg.feedback.notification {
-                    feedback::problem("The clip was not saved", &why);
+            // Without ffprobe, or with a file it will not read, there is
+            // nothing to index it with. The app looks through the folder
+            // when it opens and takes the clip in once it can be read.
+            Err(why) => log(format!("clip saved: {}; it could not be read, so the library takes it in later: {why}", target.display())),
+        }
+        self.clips_saved += 1;
+        self.reported = None;
+        tell(waiting, &Response::Saved { path: target.clone() });
+        if self.cfg.feedback.sound {
+            feedback::play_saved();
+        }
+        if self.cfg.feedback.notification {
+            feedback::clip_saved(&game, read.as_ref().ok().map(|meta| meta.seconds), &target);
+        }
+    }
+
+    /// Whether a clip is on its way: being written by the recorder, or
+    /// being filed.
+    fn saving(&self) -> bool {
+        *self.sup.state() == State::Saving || self.filing > 0
+    }
+
+    /// Told to stop while a clip is on its way: wait for it, for a while,
+    /// rather than throw it away. Nothing new is started meanwhile.
+    async fn finish_saves(&mut self, rx: &mut mpsc::UnboundedReceiver<Msg>) {
+        if !self.saving() {
+            return;
+        }
+        log("a clip is being saved; stopping once it is");
+        // No longer wanted: the recorder is stopped when its clip is out,
+        // not started afresh.
+        self.forced = Some(false);
+        self.apply(Event::Want(false)).await;
+        let until = tokio::time::Instant::now() + FINISH_WITHIN;
+        while self.saving() {
+            let Ok(Some(msg)) = tokio::time::timeout_at(until, rx.recv()).await else {
+                log("the clip took too long; stopping without it");
+                break;
+            };
+            match msg {
+                Msg::Ipc(Request::Quit, reply) => self.quitting.push(reply),
+                Msg::Ipc(Request::Status, reply) => {
+                    let _ = reply.send(Response::Status(self.status()));
+                }
+                Msg::Ipc(_, reply) => {
+                    let _ = reply.send(Response::Error { message: "the daemon is shutting down".into() });
+                }
+                // Told a second time: now.
+                Msg::Shutdown => break,
+                Msg::Reload | Msg::RetryDue | Msg::Hotkey(_) | Msg::NoHotkey(_) => {}
+                // What the recorder says and does, the save's timer, the filing.
+                about_the_clip => {
+                    self.on(about_the_clip).await;
                 }
             }
         }
@@ -466,11 +627,32 @@ impl Daemon {
             buffer_secs: self.cfg.capture.buffer_secs,
             clips_saved: self.clips_saved,
             recording: self.way.clone().filter(|_| matches!(self.sup.state(), State::Capturing | State::Saving)),
+            version: env!("CARGO_PKG_VERSION").into(),
+            hotkey: self.hotkey_held.clone(),
+            hotkey_missing: self.hotkey_missing.clone(),
         }
     }
 
+    /// Take in which settings were not valid, and say so when it is news.
+    fn note_ignored(&mut self, ignored: Vec<String>, notify: bool) {
+        if ignored != self.ignored && !ignored.is_empty() {
+            // The rest of the settings count; these are at their defaults.
+            let names = ignored.join(", ");
+            log(format!("settings that are not valid were ignored: {names}"));
+            if notify {
+                feedback::problem("Some of Zenith's settings are not valid", &format!("Ignored, until they are fixed: {names}"));
+            }
+        }
+        self.ignored = ignored;
+    }
+
+    /// Read the settings again, the way they are read at the start: one
+    /// value that is not valid is left at its default and named, and does
+    /// not keep the rest from counting. Only a file that cannot be read at
+    /// all is refused, and the settings stay as they were.
     async fn reload(&mut self) -> Result<(), String> {
-        let cfg = Config::load(&self.opts.config).map_err(|e| e.to_string())?;
+        let (cfg, ignored) = Config::load_lenient(&self.opts.config).map_err(|e| e.to_string())?;
+        self.note_ignored(ignored, cfg.feedback.notification);
         // A new combination, or another try at one that could not be taken.
         if cfg.capture.hotkey != self.cfg.capture.hotkey || self.hotkey_problem.is_some() {
             self.hotkeys.set(&cfg.capture.hotkey);
@@ -492,13 +674,20 @@ impl Daemon {
         match msg {
             Msg::Line { generation, line } => {
                 let path = PathBuf::from(line.trim());
-                if self.child.as_ref().is_some_and(|c| c.generation == generation) && path.is_absolute() && path.is_file() {
+                let ours = self.child.as_ref().is_some_and(|c| c.generation == generation);
+                if ours && path.is_absolute() && path.is_file() {
                     self.apply(Event::Saved(path)).await;
+                } else if ours && let Some(why) = recorder::save_failure_from_line(&line) {
+                    // Said at once, and the recorder left running: waiting
+                    // for the save's time to run out would end it too.
+                    log(format!("the recorder could not save the clip: {why}"));
+                    self.apply(Event::SaveFailed(why)).await;
                 }
             }
             Msg::Exited { generation, ran, detail } => {
                 if self.child.as_ref().is_some_and(|c| c.generation == generation) {
                     self.child = None;
+                    crate::control::forget_recorder(&self.opts.socket);
                     log(format!("recorder ended after {:.1} s: {detail}", ran.as_secs_f64()));
                     self.apply(Event::Exited { ran, detail }).await;
                 }
@@ -555,12 +744,21 @@ impl Daemon {
                     let _ = reply.send(answer);
                 }
                 Request::Quit => {
-                    self.quitting = Some(reply);
+                    self.quitting.push(reply);
                     return false;
                 }
             },
             Msg::Shutdown => return false,
+            Msg::Filed(filed) => self.filed(filed),
             Msg::Hotkey(outcome) => self.hotkey_went(outcome),
+            Msg::NoHotkey(why) => {
+                // One plain line, and not the same one twice running.
+                if self.hotkey_missing.as_deref() != Some(why.as_str()) {
+                    log(format!("no save hotkey from the desktop: {why}. `zenithd save` bound to a key in the desktop's settings works as before"));
+                }
+                self.hotkey_held = None;
+                self.hotkey_missing = Some(why);
+            }
         }
         true
     }
@@ -568,6 +766,8 @@ impl Daemon {
     /// Take in how holding the save hotkey went, and say so when it is
     /// news: a hotkey that silently does nothing is the worst of it.
     fn hotkey_went(&mut self, outcome: Result<String, String>) {
+        self.hotkey_missing = None;
+        self.hotkey_held = outcome.as_ref().ok().cloned();
         let problem = match outcome {
             Ok(held) => {
                 log(format!("the save hotkey is {held}"));
@@ -599,21 +799,17 @@ pub async fn run(opts: Options) -> Result<(), String> {
         crate::warn(format_args!("zenithd: no log file is kept: {e}"));
     }
 
-    let cfg = match Config::load_lenient(&opts.config) {
-        Ok((cfg, ignored)) => {
-            if !ignored.is_empty() {
-                // The rest of the settings count; these are at their defaults.
-                let names = ignored.join(", ");
-                log(format!("settings that are not valid were ignored: {names}"));
-                feedback::problem("Some of Zenith's settings are not valid", &format!("Ignored, until they are fixed: {names}"));
-            }
-            cfg
-        }
+    // A daemon that was killed may have left its recorder running, and
+    // that one would record on beside the one started here.
+    crate::control::stop_leftover(&opts.socket).await;
+
+    let (cfg, ignored) = match Config::load_lenient(&opts.config) {
+        Ok(read) => read,
         Err(e) => {
             // Clipping with the defaults beats not clipping.
             log(format!("{e}; the defaults are used"));
             feedback::problem("Zenith's settings are not valid", &e.to_string());
-            Config::default()
+            (Config::default(), Vec::new())
         }
     };
     let library = Library::open(&opts.index).map_err(|e| e.to_string())?;
@@ -628,21 +824,27 @@ pub async fn run(opts: Options) -> Result<(), String> {
         reported: None,
         buffer_megabytes: 0,
         incoming: None,
+        filing: 0,
+        stale: Vec::new(),
+        ignored: Vec::new(),
         forced: None,
         child: None,
         generation: 0,
         save_seq: 0,
         save_game: None,
         waiting: Vec::new(),
-        quitting: None,
+        quitting: Vec::new(),
         library,
         clips_saved: 0,
         hotkeys: Hotkeys::start(tx.clone()),
         hotkey_problem: None,
+        hotkey_held: None,
+        hotkey_missing: None,
         way: None,
         tx: tx.clone(),
         opts,
     };
+    daemon.note_ignored(ignored, true);
     daemon.hotkeys.set(&daemon.cfg.capture.hotkey);
     host::signals(&tx)?;
 
@@ -685,13 +887,15 @@ pub async fn run(opts: Options) -> Result<(), String> {
     }
     tray::stop(icon).await;
 
+    daemon.finish_saves(&mut rx).await;
     daemon.stop_child().await;
     daemon.answer(Response::Error { message: "the daemon is shutting down".into() });
-    let _ = std::fs::remove_dir_all(incoming(&daemon.cfg));
-    server::close(&daemon.opts.socket);
-    if let Some(reply) = daemon.quitting.take() {
-        let _ = reply.send(Response::Ok);
+    // A clip still being copied out of it is not pulled from under the copy.
+    if daemon.filing == 0 {
+        let _ = std::fs::remove_dir_all(incoming(&daemon.cfg));
     }
+    server::close(&daemon.opts.socket);
+    tell(daemon.quitting.drain(..), &Response::Ok);
     // Let the answers still being written go out before the runtime ends.
     tokio::time::sleep(Duration::from_millis(50)).await;
     log("stopped");

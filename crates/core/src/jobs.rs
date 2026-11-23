@@ -2,8 +2,16 @@
 //! the screens. What someone is looking at right now goes first, nothing is
 //! made twice, and what nobody is looking at any more is not made at all.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;
+use std::time::{Duration, Instant};
+
+/// How long what could not be made is left alone before it may be asked
+/// for again. A file that cannot be read now cannot be read four seconds
+/// from now either, but a clip that was still being written, or on a drive
+/// that was busy, can be a little later: its card should not stay blank
+/// until the app is started again.
+pub const RETRY_AFTER: Duration = Duration::from_secs(30);
 
 /// Jobs waiting to be done, in two lines: the urgent one is emptied first.
 pub struct Jobs<J> {
@@ -11,24 +19,30 @@ pub struct Jobs<J> {
     rest: VecDeque<J>,
     /// What has been asked for and is not made yet, so it is made once.
     pending: HashSet<J>,
-    /// What could not be made. It is not tried again: a file that cannot
-    /// be read now cannot be read four seconds from now either.
-    failed: HashSet<J>,
+    /// What could not be made, and when that was. It is not tried again
+    /// until `RETRY_AFTER` has passed.
+    failed: HashMap<J, Instant>,
 }
 
 impl<J> Default for Jobs<J> {
     fn default() -> Self {
-        Self { urgent: VecDeque::new(), rest: VecDeque::new(), pending: HashSet::new(), failed: HashSet::new() }
+        Self { urgent: VecDeque::new(), rest: VecDeque::new(), pending: HashSet::new(), failed: HashMap::new() }
     }
 }
 
 impl<J: Clone + Eq + Hash> Jobs<J> {
     /// Ask for a job. `false` when it is waiting or being done already, or
-    /// failed before: there is nothing new for a worker then.
+    /// failed a moment ago: there is nothing new for a worker then.
     pub fn ask(&mut self, job: J, urgent: bool) -> bool {
-        if self.failed.contains(&job) || !self.pending.insert(job.clone()) {
+        self.ask_at(job, urgent, Instant::now())
+    }
+
+    /// `ask`, at the time `now`.
+    pub fn ask_at(&mut self, job: J, urgent: bool, now: Instant) -> bool {
+        if self.failed.get(&job).is_some_and(|at| now.saturating_duration_since(*at) < RETRY_AFTER) || !self.pending.insert(job.clone()) {
             return false;
         }
+        self.failed.remove(&job);
         if urgent { self.urgent.push_back(job) } else { self.rest.push_back(job) }
         true
     }
@@ -58,10 +72,23 @@ impl<J: Clone + Eq + Hash> Jobs<J> {
 
     /// A worker is done with `job`, well or not.
     pub fn done(&mut self, job: J, failed: bool) {
+        self.done_at(job, failed, Instant::now());
+    }
+
+    /// `done`, at the time `now`.
+    pub fn done_at(&mut self, job: J, failed: bool, now: Instant) {
         self.pending.remove(&job);
         if failed {
-            self.failed.insert(job);
+            // Failures nobody asked about again are not kept for ever.
+            self.failed.retain(|_, at| now.saturating_duration_since(*at) < RETRY_AFTER);
+            self.failed.insert(job, now);
         }
+    }
+
+    /// Let what failed be asked for again now, for the jobs `changed`
+    /// picks out: their file is another one than the one that failed.
+    pub fn forgive(&mut self, changed: impl Fn(&J) -> bool) {
+        self.failed.retain(|job, _| !changed(job));
     }
 
     /// How many jobs wait for a worker.
@@ -87,8 +114,33 @@ mod tests {
         jobs.done("thumb a", false);
         assert!(jobs.ask("thumb a", false), "made and asked for again (its file was removed)");
         jobs.done("filmstrip", true);
-        assert!(!jobs.ask("filmstrip", true), "what failed is not tried again");
+        assert!(!jobs.ask("filmstrip", true), "what failed is not tried again at once");
         assert_eq!(jobs.waiting(), 2);
+    }
+
+    #[test]
+    fn what_failed_is_tried_again_after_a_while_or_when_its_file_changed() {
+        let mut jobs = Jobs::default();
+        let start = Instant::now();
+        let after = |secs: u64| start + Duration::from_secs(secs);
+        assert!(jobs.ask_at("thumb a", false, start));
+        assert_eq!(jobs.take(), Some("thumb a"));
+        jobs.done_at("thumb a", true, after(1));
+        assert!(!jobs.ask_at("thumb a", false, after(5)), "the card asks every few seconds");
+        assert!(!jobs.ask_at("thumb a", false, after(30)));
+        assert!(jobs.ask_at("thumb a", false, after(31)), "a while later it is worth another look");
+        assert!(!jobs.ask_at("thumb a", false, after(32)), "and that look is one job, not two");
+        assert_eq!(jobs.take(), Some("thumb a"));
+        // It fails again: the wait starts again from then.
+        jobs.done_at("thumb a", true, after(40));
+        assert!(!jobs.ask_at("thumb a", false, after(60)));
+        // Its file was written again meanwhile.
+        jobs.forgive(|job| *job == "thumb a");
+        assert!(jobs.ask_at("thumb a", false, after(61)));
+        // What failed long ago and was never asked for again is not kept.
+        jobs.done_at("thumb b", true, after(100));
+        jobs.done_at("thumb c", true, after(200));
+        assert_eq!(jobs.failed.len(), 1);
     }
 
     #[test]

@@ -180,6 +180,16 @@ pub trait Source {
 
 /// How often the programs and default devices are looked at again.
 pub const RESCAN: Duration = Duration::from_secs(3);
+/// The longest a stream that will not open is left before the next try.
+pub const MAX_RETRY: Duration = Duration::from_secs(60);
+
+/// How long a stream that would not open `failures` times in a row is
+/// left before the next try: a look's time at first, twice as long each
+/// time after, up to a minute. A try can take its time (a headset that is
+/// switched off is waited for), and it is made on the thread that mixes.
+pub fn retry_delay(failures: u32) -> Duration {
+    (RESCAN * 2u32.pow(failures.clamp(1, 8) - 1)).min(MAX_RETRY)
+}
 
 struct Slot {
     tap: Tap,
@@ -188,6 +198,10 @@ struct Slot {
     stream: Option<Box<dyn Stream>>,
     /// The last failure said in the log, so it is said once.
     said: Option<String>,
+    /// How many times in a row it would not open, and when (by the
+    /// mixer's time) it is tried next.
+    failures: u32,
+    retry_at: Duration,
     /// What the stream gave and the clock has not taken yet. Each stream
     /// has its own: they give their sound a packet at a time, each at its
     /// own moment, and are only in step once each is laid against the clock.
@@ -278,8 +292,8 @@ impl TrackSource {
         self.last_error = Some(message);
     }
 
-    /// Bring the open streams in line with what should be recorded now.
-    fn rescan(&mut self) {
+    /// Bring the open streams in line with what should be recorded at `now`.
+    fn rescan(&mut self, now: Duration) {
         let procs = if self.spec.needs_processes() { self.table.snapshot() } else { Vec::new() };
         let plan = plan(&self.spec, &procs);
         if self.planned.as_ref() != Some(&plan) {
@@ -295,11 +309,19 @@ impl TrackSource {
             let default_id = self.default_of(tap);
             // A stream that is still the right one is kept as it is.
             let kept = old.iter().position(|s| s.tap == *tap && s.default_id == default_id).map(|at| old.remove(at));
-            let mut slot = kept.unwrap_or_else(|| Slot { tap: tap.clone(), default_id, stream: None, said: None, buffer: TrackBuffer::default() });
-            if slot.stream.is_none() {
+            let mut slot = kept.unwrap_or_else(|| Slot { tap: tap.clone(), default_id, stream: None, said: None, failures: 0, retry_at: Duration::ZERO, buffer: TrackBuffer::default() });
+            // One that would not open is left alone for longer each time;
+            // one that was open and ended is opened again at this look.
+            if slot.stream.is_none() && now >= slot.retry_at {
                 slot.stream = self.open(tap, &mut slot.said);
-                if slot.stream.is_some() && self.planned.is_some() {
-                    self.recreations += 1;
+                if slot.stream.is_some() {
+                    slot.failures = 0;
+                    if self.planned.is_some() {
+                        self.recreations += 1;
+                    }
+                } else {
+                    slot.failures += 1;
+                    slot.retry_at = now + retry_delay(slot.failures);
                 }
             }
             self.slots.push(slot);
@@ -322,7 +344,7 @@ impl Source for TrackSource {
     fn fill(&mut self, now: Duration, out: &mut [f32], owed: usize) {
         if now >= self.next_scan {
             self.next_scan = now + RESCAN;
-            self.rescan();
+            self.rescan(now);
         }
         out.fill(0.0);
         self.one.resize(out.len(), 0.0);
@@ -713,6 +735,54 @@ mod tests {
         look(&mut track, secs(3));
         assert_eq!(fake.0.borrow().opened, [Tap::Input(None)]);
         assert!(track.status().starts_with("1 of 1 streams open, 1 re-creations"), "{}", track.status());
+    }
+
+    #[test]
+    fn a_source_that_keeps_failing_is_tried_less_and_less_often() {
+        assert_eq!(retry_delay(1), RESCAN);
+        assert_eq!(retry_delay(2), RESCAN * 2);
+        assert_eq!(retry_delay(4), RESCAN * 8);
+        assert_eq!(retry_delay(6), MAX_RETRY);
+        assert_eq!(retry_delay(u32::MAX), MAX_RETRY);
+        // Counted by asking the opener for a tap it refuses: every look is
+        // three seconds after the last, for ten minutes.
+        struct Counting(Rc<RefCell<Vec<u64>>>, Rc<RefCell<bool>>);
+        impl Opener for Counting {
+            fn open(&mut self, _tap: &Tap) -> Result<Box<dyn Stream>, String> {
+                if *self.1.borrow() {
+                    return Ok(Box::new(NoSound));
+                }
+                Err("0x88890004".into())
+            }
+            fn default_id(&mut self, _output: bool) -> Option<String> {
+                // Asked once at every look, before the stream is opened or left.
+                let mut looks = self.0.borrow_mut();
+                let look = looks.len() as u64;
+                looks.push(look);
+                None
+            }
+        }
+        let (looks, plugged_in) = (Rc::new(RefCell::new(Vec::new())), Rc::new(RefCell::new(false)));
+        let table = Arc::new(ProcessTable::default());
+        let mut track = TrackSource::new("track 0".into(), Spec::DefaultInput, Box::new(Counting(looks.clone(), plugged_in.clone())), table);
+        let mut tried_at = Vec::new();
+        for look_at in (0..600).step_by(3) {
+            look(&mut track, secs(look_at));
+            if track.slots[0].retry_at > secs(look_at) && tried_at.last() != Some(&track.slots[0].retry_at) {
+                tried_at.push(track.slots[0].retry_at);
+            }
+        }
+        assert_eq!(looks.borrow().len(), 200, "it is looked at as often as ever");
+        let waits: Vec<u64> = std::iter::once(0).chain(tried_at.iter().map(Duration::as_secs)).collect::<Vec<_>>().windows(2).map(|w| w[1] - w[0]).collect();
+        assert_eq!(waits[..6], [3, 6, 12, 24, 48, 60], "{waits:?}");
+        assert!(waits[6..].iter().all(|&wait| wait == 60), "{waits:?}");
+        assert!(tried_at.len() < 20, "a try every three seconds would have been 200: {}", tried_at.len());
+        // Plugged in: open at the next try, and the count starts over.
+        *plugged_in.borrow_mut() = true;
+        let next = *tried_at.last().unwrap();
+        look(&mut track, next);
+        assert!(track.slots[0].stream.is_some());
+        assert_eq!(track.slots[0].failures, 0);
     }
 
     #[test]

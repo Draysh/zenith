@@ -14,8 +14,10 @@ use cxx_qt_lib::QString;
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::cell::OnceCell;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 #[cxx_qt::bridge]
 pub mod ffi {
@@ -60,9 +62,16 @@ pub mod ffi {
         #[qinvokable]
         fn set_muted(self: Pin<&mut Editor>, track: i32, muted: bool) -> QString;
         /// Put this clip's sound later (or, below zero, earlier) against
-        /// its picture, in milliseconds.
+        /// its picture, in milliseconds. One small step after another (the
+        /// wheel's notches, a key held down) is one step to undo, and is
+        /// kept in the library when the stepping rests: `settle` says when.
         #[qinvokable]
         fn set_audio_offset(self: Pin<&mut Editor>, ms: i32) -> QString;
+        /// The stepping of `setAudioOffset` has come to rest (or the page
+        /// is going): what it came to is kept, and the next step is a new
+        /// one to undo. Returns the state.
+        #[qinvokable]
+        fn settle(self: Pin<&mut Editor>) -> QString;
         #[qinvokable]
         fn grab(self: Pin<&mut Editor>);
         #[qinvokable]
@@ -119,9 +128,34 @@ pub struct EditorRust {
     history: Option<History<Edit>>,
     /// The edit as it was when a handle was grabbed.
     grabbed: Option<Edit>,
-    cancel: Arc<AtomicBool>,
-    /// An export is running; it clears this itself when it ends.
-    exporting: Arc<AtomicBool>,
+    /// The sound's place is being stepped (see `set_audio_offset`): the
+    /// steps so far are one state in the history, not yet in the library.
+    nudging: bool,
+    /// The library, opened once: every step of an edit is kept in it, on
+    /// the window's thread, which opening it anew each time would hold up.
+    db: OnceCell<Option<lib::Library>>,
+}
+
+/// The export that is running: the flag that stops it. Kept apart from the
+/// editor's own state so that `stop_export` can reach it once the window is
+/// gone. The export takes it out again when it ends.
+static EXPORT: Mutex<Option<Arc<AtomicBool>>> = Mutex::new(None);
+
+fn export() -> std::sync::MutexGuard<'static, Option<Arc<AtomicBool>>> {
+    // Whoever held it last only put a flag in or took one out.
+    EXPORT.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Stop the export that is running, if one is, and wait for it to end: for
+/// when the program is leaving. ffmpeg is stopped and what it had written
+/// so far removed by the export itself; this waits for that, up to `most`.
+pub fn stop_export(most: Duration) {
+    let Some(cancel) = export().clone() else { return };
+    cancel.store(true, Ordering::Relaxed);
+    let until = Instant::now() + most;
+    while export().is_some() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn library() -> Option<lib::Library> {
@@ -136,6 +170,12 @@ fn file_name(title: &str) -> String {
 impl EditorRust {
     fn edit(&self) -> Option<&Edit> {
         self.history.as_ref().map(History::now)
+    }
+
+    /// The window's own connection to the library (the export's thread
+    /// opens one of its own).
+    fn db(&self) -> Option<&lib::Library> {
+        self.db.get_or_init(library).as_ref()
     }
 
     fn state(&self) -> String {
@@ -157,14 +197,24 @@ impl EditorRust {
     /// recorded: the clip then stays so, instead of starting again from the
     /// volumes the settings give a clip not edited yet.
     fn persist(&self) {
-        if let (Some(clip), Some(edit), Some(db)) = (&self.clip, self.edit(), library()) {
+        if let (Some(clip), Some(edit), Some(db)) = (&self.clip, self.edit(), self.db()) {
             let _ = db.set_edit(clip.id, Some(edit));
+        }
+    }
+
+    /// End a run of sync steps: what they came to is kept in the library.
+    /// Before anything else is done to the edit, so that it is a step of
+    /// its own.
+    fn settle(&mut self) {
+        if std::mem::take(&mut self.nudging) {
+            self.persist();
         }
     }
 
     /// Change the edit. While a handle is grabbed the change replaces the
     /// current state; otherwise it is a step of its own.
     fn change(&mut self, f: impl FnOnce(&mut Edit)) -> String {
+        self.settle();
         if let Some(history) = &mut self.history {
             let mut next = history.now().clone();
             f(&mut next);
@@ -186,8 +236,10 @@ impl EditorRust {
 
 impl ffi::Editor {
     fn open(mut self: Pin<&mut Self>, id: i64) -> QString {
-        let clip = library().and_then(|db| db.get(id).ok().flatten());
         let mut this = self.as_mut().rust_mut();
+        // The clip open until now keeps what its last steps came to.
+        this.settle();
+        let clip = this.db().and_then(|db| db.get(id).ok().flatten());
         this.grabbed = None;
         this.history = clip.as_ref().map(|c| {
             // An edit kept for a file that has since changed length is dropped.
@@ -197,7 +249,7 @@ impl ffi::Editor {
                 // settings give each kind of track. From its first change
                 // on, its volumes are its own.
                 let mut edit = Edit::new(c.seconds, c.tracks.len());
-                let start = Config::load(&paths::config_file()).unwrap_or_default().editor;
+                let start = Config::load_usable(&paths::config_file()).editor;
                 for (i, track) in c.tracks.iter().enumerate() {
                     edit.set_volume(i, start.initial_volume(*track));
                 }
@@ -249,16 +301,44 @@ impl ffi::Editor {
     }
 
     fn set_audio_offset(mut self: Pin<&mut Self>, ms: i32) -> QString {
-        QString::from(&self.as_mut().rust_mut().change(|e| e.set_audio_offset(ms)))
+        let mut this = self.as_mut().rust_mut();
+        // Held with something else: part of that hold, as any change is.
+        if this.grabbed.is_some() {
+            return QString::from(&this.change(|e| e.set_audio_offset(ms)));
+        }
+        let this = &mut *this;
+        if let Some(history) = this.history.as_mut() {
+            let mut next = history.now().clone();
+            next.set_audio_offset(ms);
+            // The first step of a run is a step to undo; the ones after it
+            // move that step along. `settle` ends the run and keeps it.
+            if this.nudging {
+                history.amend(next);
+            } else if next != *history.now() {
+                // (A step that changes nothing, at the furthest the sound
+                // goes, starts no run: there would be no step to move along.)
+                history.push(next);
+                this.nudging = true;
+            }
+        }
+        QString::from(&this.state())
+    }
+
+    fn settle(mut self: Pin<&mut Self>) -> QString {
+        let mut this = self.as_mut().rust_mut();
+        this.settle();
+        QString::from(&this.state())
     }
 
     fn grab(mut self: Pin<&mut Self>) {
         let mut this = self.as_mut().rust_mut();
+        this.settle();
         this.grabbed = this.edit().cloned();
     }
 
     fn release(mut self: Pin<&mut Self>) -> QString {
         let mut this = self.as_mut().rust_mut();
+        this.settle();
         if let (Some(before), Some(history)) = (this.grabbed.take(), this.history.as_mut()) {
             // The whole drag becomes one step from where it began.
             let after = history.now().clone();
@@ -271,6 +351,7 @@ impl ffi::Editor {
 
     fn undo(mut self: Pin<&mut Self>) -> QString {
         let mut this = self.as_mut().rust_mut();
+        this.settle();
         if let Some(history) = this.history.as_mut() {
             history.undo();
         }
@@ -280,6 +361,7 @@ impl ffi::Editor {
 
     fn redo(mut self: Pin<&mut Self>) -> QString {
         let mut this = self.as_mut().rust_mut();
+        this.settle();
         if let Some(history) = this.history.as_mut() {
             history.redo();
         }
@@ -318,21 +400,22 @@ impl ffi::Editor {
         QString::from(&value.to_string())
     }
 
-    fn export_start(self: Pin<&mut Self>, megabytes: i32) {
+    fn export_start(mut self: Pin<&mut Self>, megabytes: i32) {
+        self.as_mut().rust_mut().settle();
         let this = self.rust();
         // The clip as the library has it now: renamed since it was opened,
         // the export carries the new name.
-        let clip = this.clip.as_ref().map(|c| library().and_then(|db| db.get(c.id).ok().flatten()).unwrap_or_else(|| c.clone()));
+        let clip = this.clip.as_ref().map(|c| this.db().and_then(|db| db.get(c.id).ok().flatten()).unwrap_or_else(|| c.clone()));
         let (Some(clip), Some(edit), Some(source)) = (clip, this.edit().cloned(), this.source()) else {
             let message = QString::from("This clip is no longer in the library.");
             return self.export_finished(-1, QString::default(), 0.0, message);
         };
         let id = clip.id;
-        if this.exporting.load(Ordering::SeqCst) {
+        if export().is_some() {
             let message = QString::from("Another export is still running. Try again when it has finished.");
             return self.export_finished(id, QString::default(), 0.0, message);
         }
-        let clip_dir = Config::load(&paths::config_file()).unwrap_or_default().library.dir;
+        let clip_dir = Config::load_usable(&paths::config_file()).library.dir;
         let full = megabytes <= 0;
         let preset = Preset::Custom { megabytes: megabytes.max(1) as u32 };
         let (output, picture, sound, limit) = if full {
@@ -355,10 +438,7 @@ impl ffi::Editor {
         };
         let cancel = Arc::new(AtomicBool::new(false));
         let qt = self.qt_thread();
-        let mut this = self.rust_mut();
-        this.cancel = cancel.clone();
-        let exporting = this.exporting.clone();
-        exporting.store(true, Ordering::SeqCst);
+        *export() = Some(cancel.clone());
         std::thread::spawn(move || {
             let job = Job { input: clip.path.clone(), output: output.clone(), edit, picture, sound };
             let progress_qt = qt.clone();
@@ -387,16 +467,19 @@ impl ffi::Editor {
                 Err(ExportError::Cancelled) => (String::new(), 0.0, "cancelled".to_string()),
                 Err(e) => (String::new(), 0.0, e.to_string()),
             };
-            exporting.store(false, Ordering::SeqCst);
+            // Ended, and its half-made files with it: nothing is left to stop.
+            *export() = None;
             let _ = qt.queue(move |editor| editor.export_finished(id, QString::from(&path), bytes, QString::from(&error)));
         });
     }
 
     fn export_cancel(&self) {
-        self.rust().cancel.store(true, Ordering::Relaxed);
+        if let Some(cancel) = export().as_ref() {
+            cancel.store(true, Ordering::Relaxed);
+        }
     }
 
     fn export_busy(&self) -> bool {
-        self.rust().exporting.load(Ordering::SeqCst)
+        export().is_some()
     }
 }

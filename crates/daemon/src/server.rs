@@ -27,7 +27,14 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S, tx: &mpsc::Unb
         return;
     }
     let response = match serde_json::from_str::<Request>(&line) {
-        Err(e) => Response::Error { message: format!("not a request: {e}") },
+        // A request, but not one this version knows, is from a newer
+        // Zenith than this recorder, which was left running across an update.
+        Err(e) => Response::Error {
+            message: match zenith_core::ipc::kind_of(&line, "request") {
+                Some(kind) => format!("the recorder is a different version of Zenith ({}) and does not know \"{kind}\": restart the recorder", env!("CARGO_PKG_VERSION")),
+                None => format!("not a request: {e}"),
+            },
+        },
         Ok(request) => {
             let (reply, answer) = oneshot::channel();
             let _ = tx.send(Msg::Ipc(request, reply));
@@ -119,9 +126,20 @@ pub fn listen(socket: &Path, tx: mpsc::UnboundedSender<Msg>) -> Result<Only, Str
 pub fn listen(socket: &Path, tx: mpsc::UnboundedSender<Msg>) -> Result<Only, String> {
     use tokio::net::windows::named_pipe::ServerOptions;
     // As made here the pipe is this user's: others may not write to it,
-    // and nothing from another machine may connect.
-    let first = ServerOptions::new().first_pipe_instance(true).create(socket).map_err(|e| match e.kind() {
-        std::io::ErrorKind::PermissionDenied => "it is already running".to_string(),
+    // and nothing from another machine may connect. Made as the first end
+    // or not at all, so a pipe of this name that someone else made first
+    // is never joined.
+    let first = ServerOptions::new().first_pipe_instance(true).reject_remote_clients(true).create(socket).map_err(|e| match e.kind() {
+        // The name is taken. By a daemon, if it answers like one; the name
+        // can be guessed, so it may also be something else's pipe.
+        std::io::ErrorKind::PermissionDenied => match zenith_core::ipc::ask(socket, &Request::Status, Duration::from_secs(2)) {
+            Ok(Response::Status(_)) => "it is already running".to_string(),
+            answer => format!(
+                "the pipe {} is held by something that does not answer as Zenith's recorder ({}); it cannot start until that is gone",
+                socket.display(),
+                answer.map_or_else(|e| e.to_string(), |other| format!("it answered {other:?}"))
+            ),
+        },
         _ => format!("the pipe {} could not be made: {e}", socket.display()),
     })?;
     let name = socket.to_path_buf();
@@ -133,7 +151,7 @@ pub fn listen(socket: &Path, tx: mpsc::UnboundedSender<Msg>) -> Result<Only, Str
             // so the pipe never stops existing: a client always finds an end
             // to connect to, and no second daemon can take the name.
             let next = loop {
-                match ServerOptions::new().create(&name) {
+                match ServerOptions::new().reject_remote_clients(true).create(&name) {
                     Ok(next) => break next,
                     Err(e) => {
                         log(format!("the pipe could not be opened again: {e}"));
@@ -213,6 +231,15 @@ mod tests {
         let answer = asked(b"hello\n", Response::Ok).await;
         let Response::Error { message } = serde_json::from_str(&answer).unwrap() else { panic!("{answer}") };
         assert!(message.starts_with("not a request"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_request_from_another_version_is_told_which_this_is() {
+        let answer = asked(b"{\"request\":\"pause\",\"for\":5}\n", Response::Ok).await;
+        let Response::Error { message } = serde_json::from_str(&answer).unwrap() else { panic!("{answer}") };
+        assert!(message.contains("different version") && message.contains("pause") && message.contains(env!("CARGO_PKG_VERSION")), "{message}");
+        // What it does know is taken with more said than it knows of.
+        assert_eq!(asked(b"{\"request\":\"reload\",\"quietly\":true}\n", Response::Ok).await, "{\"response\":\"ok\"}\n");
     }
 
     #[tokio::test]

@@ -135,8 +135,13 @@ pub fn open_folder(dir: &Path) {
 /// the game as well (see `overlay`), to say so there and then. The
 /// notification is still sent, and waits in Windows' notification centre
 /// with its Edit button for after the game.
-pub fn clip_saved(game: &str, seconds: f64, clip: &Path) {
-    let body = format!("{game} · {} s", seconds.round() as u32);
+///
+/// `seconds` is how long the clip is, when the file could be read.
+pub fn clip_saved(game: &str, seconds: Option<f64>, clip: &Path) {
+    let body = match seconds {
+        Some(seconds) => format!("{game} · {} s", seconds.round() as u32),
+        None => format!("{game} · saved, but the file could not be checked"),
+    };
     #[cfg(windows)]
     if crate::overlay::covers_screen() {
         crate::overlay::show("Clip saved", &body);

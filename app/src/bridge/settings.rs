@@ -9,6 +9,7 @@ use cxx_qt::{CxxQtType, Threading};
 use cxx_qt_lib::QString;
 use serde_json::{Value, json};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 #[cxx_qt::bridge]
@@ -108,6 +109,29 @@ pub mod ffi {
     impl cxx_qt::Threading for Settings {}
 }
 
+/// How many saves are still on their way to the recorder.
+static TELLING: AtomicUsize = AtomicUsize::new(0);
+
+/// One of them, done when it goes.
+struct Told;
+
+impl Drop for Told {
+    fn drop(&mut self) {
+        TELLING.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Wait, up to `most`, until the recorder has been told of every save: for
+/// when the program is leaving right after settings were kept, which must
+/// not cut the telling off. (A recorder that takes longer than that to
+/// answer has the request by then, and reads the file either way.)
+pub fn wait_for_recorder(most: Duration) {
+    let until = std::time::Instant::now() + most;
+    while TELLING.load(Ordering::SeqCst) > 0 && std::time::Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 #[derive(Default)]
 pub struct SettingsRust {
     /// The monitors, codecs and sound devices, once the recorder program
@@ -128,10 +152,20 @@ fn as_json(cfg: &Config) -> Value {
 
 impl ffi::Settings {
     fn load(&self) -> QString {
-        let cfg = Config::load(&paths::config_file()).unwrap_or_else(|e| {
-            eprintln!("zenith-clips: {e}");
-            Config::default()
-        });
+        // Every value that can be read: one that cannot must not put the
+        // rest back to their defaults, which the next change would save.
+        let cfg = match Config::load_lenient(&paths::config_file()) {
+            Ok((cfg, ignored)) => {
+                if !ignored.is_empty() {
+                    eprintln!("zenith-clips: settings not understood, left at their defaults: {}", ignored.join(", "));
+                }
+                cfg
+            }
+            Err(e) => {
+                eprintln!("zenith-clips: {e}");
+                Config::default()
+            }
+        };
         QString::from(&as_json(&cfg).to_string())
     }
 
@@ -193,7 +227,7 @@ impl ffi::Settings {
         use zenith_core::doctor::{assess, gather, worst};
         let qt = self.qt_thread();
         std::thread::spawn(move || {
-            let cfg = Config::load(&paths::config_file()).unwrap_or_default();
+            let cfg = Config::load_usable(&paths::config_file());
             let checks = assess(&gather(&cfg, recorder::PROGRAM, &paths::socket()), &cfg);
             let report = json!({ "worst": worst(&checks), "checks": checks }).to_string();
             let _ = qt.queue(move |settings| settings.doctor_ready(QString::from(&report)));
@@ -205,7 +239,7 @@ impl ffi::Settings {
         use zenith_core::{install, report};
         let qt = self.qt_thread();
         std::thread::spawn(move || {
-            let cfg = Config::load(&paths::config_file()).unwrap_or_default();
+            let cfg = Config::load_usable(&paths::config_file());
             let checks = assess(&gather(&cfg, recorder::PROGRAM, &paths::socket()), &cfg);
             let status = match ipc::ask(&paths::socket(), &Request::Status, Duration::from_secs(2)) {
                 Ok(Response::Status(status)) => Some(status),
@@ -304,7 +338,10 @@ impl ffi::Settings {
         }
         // The recorder can take seconds to answer (it restarts capture).
         let qt = self.qt_thread();
+        TELLING.fetch_add(1, Ordering::SeqCst);
         std::thread::spawn(move || {
+            // Counted until the recorder has answered or been given up on.
+            let _told = Told;
             let problem = match ipc::ask(&paths::socket(), &Request::Reload, Duration::from_secs(5)) {
                 Ok(Response::Error { message }) => message,
                 // Not running: it reads the file when it starts.

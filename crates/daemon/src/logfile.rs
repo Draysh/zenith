@@ -5,14 +5,52 @@
 
 use std::fs::File;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-/// A log past this size is put aside at the next start, so it never grows
-/// without end. One older file is kept.
+/// A log past this size is put aside, at the start and while it is being
+/// written, so it never grows without end. One older file is kept.
 const MAX_BYTES: u64 = 1024 * 1024;
 
-static LOG: OnceLock<Mutex<File>> = OnceLock::new();
+static LOG: OnceLock<Mutex<Log>> = OnceLock::new();
+
+/// The file being written, and how long it has become.
+struct Log {
+    path: PathBuf,
+    max_bytes: u64,
+    /// `None` only for the moment it is put aside, or when it could not
+    /// be opened again after that.
+    file: Option<File>,
+    bytes: u64,
+}
+
+impl Log {
+    fn start(path: &Path, max_bytes: u64) -> std::io::Result<Self> {
+        let file = open(path, max_bytes)?;
+        let bytes = file.metadata().map(|m| m.len()).unwrap_or(0);
+        Ok(Self { path: path.to_path_buf(), max_bytes, file: Some(file), bytes })
+    }
+
+    /// Add `text`. When that makes the file too long it is put aside and
+    /// a new one begun, as at a start: the daemon runs for weeks.
+    fn add(&mut self, text: &[u8]) {
+        if self.bytes > self.max_bytes {
+            // Closed first: Windows does not rename a file that is open.
+            self.file = None;
+        }
+        if self.file.is_none() {
+            self.file = open(&self.path, self.max_bytes).ok();
+            // If it could not be put aside (someone is reading it), it is
+            // written on and tried again when it has grown as much again.
+            self.bytes = 0;
+        }
+        if let Some(file) = &mut self.file
+            && file.write_all(text).is_ok()
+        {
+            self.bytes += text.len() as u64;
+        }
+    }
+}
 
 /// Open `path` to add to, making its folder. A file grown too long becomes
 /// `<name>.old` first, in place of the one before it.
@@ -37,8 +75,8 @@ fn stamped(when: chrono::DateTime<chrono::Local>, text: &dyn std::fmt::Display) 
 
 /// From now on, also write every line to `path`.
 pub fn start(path: &Path) -> std::io::Result<()> {
-    let file = open(path, MAX_BYTES)?;
-    let _ = LOG.set(Mutex::new(file));
+    let log = Log::start(path, MAX_BYTES)?;
+    let _ = LOG.set(Mutex::new(log));
     Ok(())
 }
 
@@ -46,8 +84,8 @@ pub fn start(path: &Path) -> std::io::Result<()> {
 /// reason to stop recording, so a line that cannot be written is let go.
 pub fn line(text: &dyn std::fmt::Display) {
     if let Some(log) = LOG.get() {
-        let mut file = log.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = file.write_all(stamped(chrono::Local::now(), text).as_bytes());
+        let mut log = log.lock().unwrap_or_else(|e| e.into_inner());
+        log.add(stamped(chrono::Local::now(), text).as_bytes());
     }
 }
 
@@ -78,5 +116,24 @@ mod tests {
         std::fs::write(&path, "x".repeat(11)).unwrap();
         drop(open(&path, 10).unwrap());
         assert_eq!(std::fs::read_to_string(&old).unwrap(), "x".repeat(11), "only one old log is kept");
+    }
+
+    #[test]
+    fn a_log_that_grows_too_long_while_running_is_put_aside_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("zenithd.log");
+        let old = dir.path().join("zenithd.log.old");
+        std::fs::write(&path, "before\n").unwrap();
+        let mut log = Log::start(&path, 20).unwrap();
+        log.add(b"one two three\n");
+        assert!(!old.exists(), "21 bytes: too long only now");
+        log.add(b"four\n");
+        assert_eq!(std::fs::read_to_string(&old).unwrap(), "before\none two three\n");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "four\n");
+        for _ in 0..50 {
+            log.add(b"a line of the log\n");
+        }
+        let (now, aside) = (std::fs::metadata(&path).unwrap().len(), std::fs::metadata(&old).unwrap().len());
+        assert!(now <= 20 + 18 && aside <= 20 + 18, "neither file grows past the limit by more than a line: {now}, {aside}");
     }
 }

@@ -44,6 +44,10 @@ pub struct Facts {
     pub folder_writable: bool,
     /// The daemon's state, when it answers.
     pub daemon: Option<(String, Option<String>)>,
+    /// The save hotkey the daemon says it has, and why the desktop gives
+    /// it none where it says that (`ipc::Status`).
+    pub hotkey: Option<String>,
+    pub hotkey_missing: Option<String>,
 }
 
 fn runs(program: &str, arg: &str) -> Option<String> {
@@ -65,6 +69,10 @@ fn writable(dir: &Path) -> bool {
 pub fn gather(cfg: &Config, recorder: &str, socket: &Path) -> Facts {
     let info = runs(recorder, "--info");
     let encoders = runs("ffmpeg", "-encoders");
+    let status = match ipc::ask(socket, &Request::Status, Duration::from_secs(1)) {
+        Ok(Response::Status(status)) => Some(status),
+        _ => None,
+    };
     Facts {
         recorder_installed: info.is_some(),
         codecs: info.as_deref().map(outputs::parse_codecs).unwrap_or_default(),
@@ -76,10 +84,9 @@ pub fn gather(cfg: &Config, recorder: &str, socket: &Path) -> Facts {
         // Only Linux plays the save sound through a program.
         sound_player: !cfg!(windows) && ["pw-play", "paplay"].iter().any(|p| runs(p, "--version").is_some()),
         folder_writable: writable(&cfg.library.dir),
-        daemon: match ipc::ask(socket, &Request::Status, Duration::from_secs(1)) {
-            Ok(Response::Status(s)) => Some((s.state, s.detail)),
-            _ => None,
-        },
+        hotkey: status.as_ref().and_then(|s| s.hotkey.clone()),
+        hotkey_missing: status.as_ref().and_then(|s| s.hotkey_missing.clone()),
+        daemon: status.map(|s| (s.state, s.detail)),
     }
 }
 
@@ -265,6 +272,22 @@ pub fn assess_on(facts: &Facts, cfg: &Config, platform: Platform) -> Vec<Check> 
         out.push(check("Save hotkey", Level::Warning, format!("{detail}."), "Pick another key combination in Settings."));
     }
 
+    // On Linux the desktop gives the daemon a hotkey, where it can and the
+    // user lets it; where not, a key has to be bound to `zenithd save` by
+    // hand, which cannot be seen from here.
+    if !windows && facts.daemon.is_some() {
+        match (&facts.hotkey, &facts.hotkey_missing) {
+            (Some(held), _) => out.push(check("Save hotkey", Level::Ok, format!("{held}."), "")),
+            (None, Some(why)) => out.push(check(
+                "Save hotkey",
+                Level::Warning,
+                format!("Zenith has none of its own: {why}."),
+                "Bind `zenithd save` to a key in your desktop's keyboard settings, if you have not already.",
+            )),
+            (None, None) => {}
+        }
+    }
+
     // Windows plays the sound itself; only Linux needs a player for it.
     if !windows && cfg.feedback.sound && !facts.sound_player {
         out.push(check(
@@ -305,6 +328,8 @@ mod tests {
             sound_player: true,
             folder_writable: true,
             daemon: Some(("idle".into(), None)),
+            hotkey: None,
+            hotkey_missing: None,
         }
     }
 
@@ -431,6 +456,25 @@ mod tests {
         assert_eq!(level(&checks, "Background recorder"), Level::Ok);
         assert!(fix(&checks, "Save hotkey").contains("Settings"));
         assert!(!assess_all(&taken, &Config::default()).iter().any(|c| c.name == "Save hotkey"));
+    }
+
+    #[test]
+    fn linux_says_where_the_hotkey_comes_from() {
+        let bound = Facts { hotkey: Some("Alt+F9 (bound through the desktop)".into()), ..healthy() };
+        let checks = assess_all(&bound, &Config::default());
+        assert_eq!(level(&checks, "Save hotkey"), Level::Ok);
+        assert!(checks.iter().any(|c| c.name == "Save hotkey" && c.detail.contains("through the desktop")));
+
+        let none = Facts { hotkey_missing: Some("the desktop cannot be asked for one (no portal)".into()), ..healthy() };
+        let checks = assess_all(&none, &Config::default());
+        assert_eq!(level(&checks, "Save hotkey"), Level::Warning);
+        assert!(fix(&checks, "Save hotkey").contains("`zenithd save`"));
+        assert!(checks.iter().any(|c| c.name == "Save hotkey" && c.detail.contains("no portal")));
+
+        // A daemon that says nothing about it (an older one), or none at all: nothing is claimed.
+        assert!(!assess_all(&healthy(), &Config::default()).iter().any(|c| c.name == "Save hotkey"));
+        let stopped = Facts { daemon: None, hotkey_missing: Some("x".into()), ..healthy() };
+        assert!(!assess_all(&stopped, &Config::default()).iter().any(|c| c.name == "Save hotkey"));
     }
 
     #[test]

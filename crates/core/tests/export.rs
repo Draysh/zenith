@@ -81,6 +81,38 @@ fn an_edited_clip_is_exported_under_the_limit() {
 }
 
 #[test]
+fn a_result_over_the_limit_is_made_again_smaller_or_given_up() {
+    if !have_ffmpeg() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let input = sample(dir.path());
+    let meta = probe(&input).unwrap();
+    let mut edit = Edit::new(meta.seconds, 3);
+    edit.trim_end(6.0);
+    // Planned for 1 MB, then held to less: the first try comes out too big.
+    let source = Source { width: meta.width, height: meta.height, fps: meta.fps, seconds: edit.kept(), has_audio: true };
+    let p = plan(source, Preset::Custom { megabytes: 1 }).unwrap();
+    let output = dir.path().join("out/smaller.mp4");
+    let job = Job { input, output: output.clone(), edit, picture: Picture::Fit(p), sound: Sound::Mixed };
+    let limit = 600 * 1024;
+    let mut seen = Vec::new();
+    let bytes = run(&job, Some(limit), &AtomicBool::new(false), |f| seen.push(f)).unwrap();
+    assert!(bytes <= limit && bytes > limit / 2, "{bytes} bytes");
+    assert_eq!(std::fs::metadata(&output).unwrap().len(), bytes);
+    assert_eq!(seen.last(), Some(&1.0));
+    assert!(seen.windows(2).all(|w| w[1] > w[0]), "progress only moves forward, also through another try: {seen:?}");
+
+    // A limit the sound alone is over: every try is too big, and nothing is left.
+    let mut seen = Vec::new();
+    let err = run(&job, Some(20 * 1024), &AtomicBool::new(false), |f| seen.push(f)).unwrap_err();
+    assert!(matches!(err, ExportError::TooBig { actual, limit: 20480 } if actual > 20480), "{err}");
+    assert!(seen.windows(2).all(|w| w[1] > w[0]) && seen.last().is_some_and(|f| *f < 1.0), "{seen:?}");
+    let left: Vec<_> = std::fs::read_dir(output.parent().unwrap()).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(left, ["smaller.mp4"], "the result from before is still there, and nothing else");
+}
+
+#[test]
 fn sound_moved_against_the_picture_exports_at_the_same_length() {
     if !have_ffmpeg() {
         return;

@@ -440,6 +440,15 @@ impl Config {
         Ok((cfg, ignored))
     }
 
+    /// The settings to work with, whatever state the file is in: every
+    /// value that can be read, and the defaults for the rest. What the
+    /// window uses, so one value it cannot read (a typing mistake, or one
+    /// written by a newer Zenith) does not put every setting back to its
+    /// default, and then over the file at the next change.
+    pub fn load_usable(path: &Path) -> Self {
+        Self::load_lenient(path).map(|(cfg, _)| cfg).unwrap_or_default()
+    }
+
     fn read_lenient(text: &str) -> Result<(Self, Vec<String>), String> {
         let read = |table: &toml::Table| toml::Value::Table(table.clone()).try_into::<Self>();
         let table: toml::Table = text.parse().map_err(|e: toml::de::Error| e.to_string())?;
@@ -455,16 +464,39 @@ impl Config {
                 continue;
             };
             for (key, value) in values {
-                let mut trial = good.clone();
-                let slot = trial.entry(section.clone()).or_insert_with(|| toml::Value::Table(Default::default()));
-                if let toml::Value::Table(slot) = slot {
-                    slot.insert(key.clone(), value);
-                }
+                let with = |value: toml::Value| {
+                    let mut trial = good.clone();
+                    let slot = trial.entry(section.clone()).or_insert_with(|| toml::Value::Table(Default::default()));
+                    if let toml::Value::Table(slot) = slot {
+                        slot.insert(key.clone(), value);
+                    }
+                    trial
+                };
+                let trial = with(value.clone());
                 if read(&trial).is_ok() {
                     good = trial;
-                } else {
-                    ignored.push(format!("{section}.{key}"));
+                    continue;
                 }
+                // A list is not lost for one entry in it (an added game
+                // with a number for a name): the entries are put in one at
+                // a time too. Where no list belongs at all, not even an
+                // empty one reads, and the whole value is left out.
+                let entries = match value {
+                    toml::Value::Array(entries) if read(&with(toml::Value::Array(Vec::new()))).is_ok() => entries,
+                    _ => {
+                        ignored.push(format!("{section}.{key}"));
+                        continue;
+                    }
+                };
+                let mut kept = Vec::new();
+                for (at, entry) in entries.into_iter().enumerate() {
+                    kept.push(entry);
+                    if read(&with(toml::Value::Array(kept.clone()))).is_err() {
+                        kept.pop();
+                        ignored.push(format!("{section}.{key}[{at}]"));
+                    }
+                }
+                good = with(toml::Value::Array(kept));
             }
         }
         let cfg = read(&good).map_err(|e| e.to_string())?;
@@ -472,15 +504,48 @@ impl Config {
     }
 
     /// Write the file whole: to a temporary one beside it, then renamed over.
+    /// The temporary file is this process's and this call's own (the window
+    /// and the recorder both write the settings), and is on the disk before
+    /// it takes the file's place, so a power cut leaves the old settings or
+    /// the new ones and never half a file.
     pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
+        use std::io::Write;
         let err = |e| ConfigError::Write(path.into(), e);
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(err)?;
         }
-        let text = toml::to_string_pretty(self).expect("the settings serialize");
-        let tmp = path.with_extension("toml.tmp");
-        std::fs::write(&tmp, text).map_err(err)?;
-        std::fs::rename(&tmp, path).map_err(err)
+        // A clip folder whose name is not text cannot be written as TOML:
+        // that is said, and the file stays as it was.
+        let text = toml::to_string_pretty(self).map_err(|e| err(std::io::Error::other(e.to_string())))?;
+        // A file with something in it that was not understood is about to
+        // lose that: a copy of it is kept beside it, as it was.
+        if let Ok(old) = std::fs::read_to_string(path)
+            && toml::from_str::<Self>(&old).is_err()
+        {
+            let _ = std::fs::write(path.with_extension("toml.bak"), old);
+        }
+        static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = path.with_extension(format!("toml.{}-{call}.tmp", std::process::id()));
+        let written = std::fs::File::create(&tmp)
+            .and_then(|mut file| {
+                file.write_all(text.as_bytes())?;
+                file.sync_all()
+            })
+            .and_then(|()| std::fs::rename(&tmp, path));
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(err(e));
+        }
+        // The new name is on the disk too once its folder is. Not every
+        // system can do that for a folder, and the file is whole either way.
+        #[cfg(unix)]
+        if let Some(dir) = path.parent()
+            && let Ok(dir) = std::fs::File::open(dir)
+        {
+            let _ = dir.sync_all();
+        }
+        Ok(())
     }
 }
 
@@ -604,6 +669,32 @@ mod tests {
     }
 
     #[test]
+    fn the_window_keeps_what_it_can_read_and_a_copy_of_what_it_could_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let written = "[capture]\nfps = 30\ncodec = \"from-a-newer-zenith\"\n[library]\ndir = \"/clips\"\n";
+        std::fs::write(&path, written).unwrap();
+        let cfg = Config::load_usable(&path);
+        assert_eq!(cfg.capture.fps, 30);
+        assert_eq!(cfg.library.dir, PathBuf::from("/clips"));
+        // Saved again, the file is as the window read it, and the one it
+        // was made from is still there to look at.
+        let bak = dir.path().join("config.toml.bak");
+        cfg.save(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), written);
+        assert_eq!(Config::load(&path).unwrap(), cfg);
+        // A file that reads whole is not copied.
+        std::fs::remove_file(&bak).unwrap();
+        cfg.save(&path).unwrap();
+        assert!(!bak.exists());
+        // Not TOML at all: the defaults, and the file kept when they are saved.
+        std::fs::write(&path, "[capture\nfps = ").unwrap();
+        assert_eq!(Config::load_usable(&path), Config::default());
+        Config::default().save(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), "[capture\nfps = ");
+    }
+
+    #[test]
     fn one_bad_value_does_not_cost_the_others() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -624,6 +715,73 @@ mod tests {
         std::fs::write(&path, "this is not = = toml").unwrap();
         assert!(matches!(Config::load_lenient(&path), Err(ConfigError::Parse(..))));
         assert_eq!(Config::load_lenient(&dir.path().join("none.toml")).unwrap().0, Config::default());
+    }
+
+    #[test]
+    fn one_bad_entry_in_a_list_does_not_cost_the_others() {
+        let text = r#"
+            [audio]
+            voice_apps = ["Discord", 7, "Mumble"]
+
+            [capture]
+            fps = [30, 60]
+
+            [[games.added]]
+            name = "Hades"
+            program = "hades.exe"
+
+            [[games.added]]
+            name = 5
+            program = "five.exe"
+
+            [[games.added]]
+            name = "Celeste"
+            program = "celeste.exe"
+        "#;
+        assert!(toml::from_str::<Config>(text).is_err());
+        let (cfg, ignored) = Config::read_lenient(text).unwrap();
+        assert_eq!(ignored, ["audio.voice_apps[1]", "capture.fps", "games.added[1]"]);
+        let games: Vec<&str> = cfg.games.added.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(games, ["Hades", "Celeste"]);
+        assert_eq!(cfg.audio.voice_apps, ["Discord", "Mumble"]);
+        assert_eq!(cfg.capture.fps, 60, "a list where a number goes is left out whole");
+    }
+
+    #[test]
+    fn saving_leaves_only_the_settings_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        // The window and the recorder, saving at the same moment.
+        std::thread::scope(|all| {
+            for fps in [30, 60, 120, 144] {
+                let path = &path;
+                all.spawn(move || {
+                    let mut cfg = Config::default();
+                    cfg.capture.fps = fps;
+                    for _ in 0..20 {
+                        cfg.save(path).unwrap();
+                    }
+                });
+            }
+        });
+        assert!([30, 60, 120, 144].contains(&Config::load(&path).unwrap().capture.fps), "one of them, whole");
+        let left: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(left, ["config.toml"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_clip_folder_that_cannot_be_written_down_is_an_error_and_keeps_the_file() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        Config::default().save(&path).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let mut cfg = Config::default();
+        cfg.library.dir = PathBuf::from(std::ffi::OsStr::from_bytes(b"/clips/\xff\xfe"));
+        assert!(matches!(cfg.save(&path), Err(ConfigError::Write(..))));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]

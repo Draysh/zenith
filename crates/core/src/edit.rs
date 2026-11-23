@@ -60,11 +60,50 @@ pub struct Edit {
 /// The furthest a clip's sound may be moved against its picture, either way.
 pub const MAX_AUDIO_OFFSET_MS: i32 = 3000;
 
+/// How far an edit's length may be from its file's and still be an edit of
+/// that file: two readings of one file differ by a frame or so.
+pub const LENGTH_SLACK: f64 = 0.5;
+
 impl Edit {
     /// The whole clip, as recorded.
     pub fn new(duration: f64, audio_tracks: usize) -> Self {
         let duration = duration.max(MIN_SEGMENT);
         Self { duration, segments: vec![Segment { start: 0.0, end: duration }], gains: vec![Gain::default(); audio_tracks], audio_offset_ms: 0 }
+    }
+
+    /// An edit as it was kept, made fit to work with for a file of
+    /// `seconds`. What is kept is not checked when it is written and may be
+    /// from another Zenith, or about a file that has since been replaced:
+    /// an edit of another length than the file is dropped (the clip is one
+    /// not edited yet), and stretches that are out of order, outside the
+    /// clip or too short are put right or left out, so that everything else
+    /// here can count on what the fields say. An edit that was made here
+    /// comes back as it is.
+    pub fn fitted(mut self, seconds: f64) -> Option<Self> {
+        let numbers = self.duration.is_finite() && self.segments.iter().all(|s| s.start.is_finite() && s.end.is_finite());
+        if !numbers || self.duration <= 0.0 || (self.duration - seconds).abs() >= LENGTH_SLACK {
+            return None;
+        }
+        let mut from = 0.0;
+        let mut kept = Vec::with_capacity(self.segments.len());
+        for s in &self.segments {
+            let (start, end) = (s.start.max(from), s.end.min(self.duration));
+            // The same hair of slack the trims give a stretch.
+            if end - start >= MIN_SEGMENT - 1e-9 {
+                kept.push(Segment { start, end });
+                from = end;
+            }
+        }
+        if kept.is_empty() {
+            // Never empty: the whole clip, with the volumes it had.
+            kept.push(Segment { start: 0.0, end: self.duration });
+        }
+        self.segments = kept;
+        for gain in &mut self.gains {
+            gain.volume = if gain.volume.is_finite() { gain.volume.clamp(0.0, 2.0) } else { 1.0 };
+        }
+        self.audio_offset_ms = self.audio_offset_ms.clamp(-MAX_AUDIO_OFFSET_MS, MAX_AUDIO_OFFSET_MS);
+        Some(self)
     }
 
     /// Whether any of the clip is cut away: a trimmed end or a removed
@@ -137,7 +176,9 @@ impl Edit {
 
     /// Trim the front: the result starts at `t`.
     pub fn trim_start(&mut self, t: f64) {
-        let t = t.clamp(0.0, self.segments.last().map_or(0.0, |s| s.end - MIN_SEGMENT));
+        // Not `clamp`, which panics when its bounds cross (a clip shorter
+        // than the shortest stretch): release builds abort on a panic.
+        let t = t.min(self.segments.last().map_or(0.0, |s| s.end - MIN_SEGMENT)).max(0.0);
         // A hair of slack: 10.0 - 9.9 is a little under 0.1 in floating point.
         self.segments.retain(|s| s.end - t >= MIN_SEGMENT - 1e-9);
         if let Some(first) = self.segments.first_mut() {
@@ -147,7 +188,7 @@ impl Edit {
 
     /// Trim the back: the result ends at `t`.
     pub fn trim_end(&mut self, t: f64) {
-        let t = t.clamp(self.segments.first().map_or(0.0, |s| s.start + MIN_SEGMENT), self.duration);
+        let t = t.max(self.segments.first().map_or(0.0, |s| s.start + MIN_SEGMENT)).min(self.duration);
         self.segments.retain(|s| t - s.start >= MIN_SEGMENT - 1e-9);
         if let Some(last) = self.segments.last_mut() {
             last.end = last.end.min(t);
@@ -381,6 +422,60 @@ mod tests {
         assert!(e.is_trimmed());
         e.set_end(1, 60.0);
         assert!(!e.is_trimmed(), "put back, it is whole again");
+    }
+
+    #[test]
+    fn an_edit_made_here_is_fit_as_it_is() {
+        let mut e = Edit::new(60.0, 2);
+        e.split(10.0);
+        e.split(20.0);
+        e.remove(1);
+        e.trim_start(5.0);
+        e.trim_end(0.0);
+        e.set_volume(1, 0.3);
+        e.set_audio_offset(-250);
+        assert_eq!(e.clone().fitted(60.0), Some(e.clone()));
+        assert_eq!(e.clone().fitted(60.3), Some(e.clone()), "two readings of one file");
+        assert_eq!(Edit::new(0.04, 1).fitted(0.04), Some(Edit::new(0.04, 1)), "a clip shorter than the shortest stretch");
+        // The file is another one now, longer or shorter.
+        assert_eq!(e.clone().fitted(30.0), None);
+        assert_eq!(e.fitted(90.0), None);
+    }
+
+    #[test]
+    fn an_edit_that_was_kept_wrong_is_put_right_and_never_panics() {
+        let read = |json: &str| serde_json::from_str::<Edit>(json).unwrap();
+        // Out of order, overlapping, outside the clip, too short, backwards.
+        let odd = read(
+            r#"{"duration":10.0,"segments":[{"start":-3.0,"end":2.0},{"start":1.0,"end":4.0},{"start":4.0,"end":4.01},{"start":9.0,"end":7.0},{"start":8.0,"end":99.0}],"gains":[{"volume":9.0,"muted":false}],"audio_offset_ms":90000}"#,
+        );
+        let e = odd.fitted(10.0).unwrap();
+        assert_eq!(spans(&e), [(0.0, 2.0), (2.0, 4.0), (8.0, 10.0)]);
+        assert_eq!((e.gains[0].volume, e.audio_offset_ms), (2.0, MAX_AUDIO_OFFSET_MS));
+        // Nothing usable in it: the whole clip.
+        let none = read(r#"{"duration":10.0,"segments":[{"start":50.0,"end":60.0}],"gains":[]}"#);
+        assert_eq!(spans(&none.fitted(10.0).unwrap()), [(0.0, 10.0)]);
+        assert_eq!(read(r#"{"duration":-4.0,"segments":[],"gains":[]}"#).fitted(-4.0), None);
+
+        // Not fitted at all, every way to change it is still safe to call.
+        for json in [
+            r#"{"duration":0.05,"segments":[{"start":0.0,"end":0.05}],"gains":[]}"#,
+            r#"{"duration":1.0,"segments":[{"start":5.0,"end":2.0}],"gains":[]}"#,
+            r#"{"duration":-1.0,"segments":[{"start":0.95,"end":1.0}],"gains":[]}"#,
+            r#"{"duration":10.0,"segments":[],"gains":[]}"#,
+        ] {
+            for t in [-1.0, 0.0, 0.5, 100.0, f64::NAN] {
+                let mut e = read(json);
+                e.trim_start(t);
+                e.trim_end(t);
+                e.set_start(0, t);
+                e.set_end(0, t);
+                e.split(t);
+                let mut e = read(json);
+                e.trim_end(t);
+                e.trim_start(t);
+            }
+        }
     }
 
     #[test]

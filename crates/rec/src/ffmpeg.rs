@@ -30,13 +30,27 @@ pub fn locate() -> PathBuf {
 /// daemon with no console, a console program gets a new one otherwise,
 /// flashing over the game for each ffmpeg we start.
 pub fn command(program: &Path) -> Command {
+    command_with(program, 0)
+}
+
+/// The same for the ffmpeg that records: one that also runs before
+/// ordinary programs. A game takes every processor it can get, and an
+/// ffmpeg that waits its turn behind it drops frames and reads the sound
+/// late.
+pub fn recording_command(program: &Path) -> Command {
+    const ABOVE_NORMAL_PRIORITY_CLASS: u32 = 0x0000_8000;
+    command_with(program, ABOVE_NORMAL_PRIORITY_CLASS)
+}
+
+#[cfg_attr(not(windows), allow(unused_variables))]
+fn command_with(program: &Path, more_flags: u32) -> Command {
     #[cfg_attr(not(windows), allow(unused_mut))]
     let mut command = Command::new(program);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
+        command.creation_flags(CREATE_NO_WINDOW | more_flags);
     }
     command
 }
@@ -248,10 +262,20 @@ impl Video {
             (Frames::Gpu, Family::Qsv) => chain.extend(["hwmap=derive_device=qsv".to_string(), "format=qsv".to_string()]),
             (Frames::Gpu, _) => {}
             (Frames::Memory, family) => {
-                if let (Grab::Ddagrab { .. } | Grab::Gdigrab { .. }, Some((w, h))) = (&self.grab, self.scale) {
-                    chain.push(format!("scale={w}:{h}:flags=bilinear"));
-                }
+                // The screen's colours are turned into the encoder's here,
+                // and said to be: as BT.709 in the limited range, by name.
+                // Left to itself the conversion is BT.601 with nothing
+                // saying so, and a player takes a picture this size for
+                // BT.709: every colour a little off.
+                let size = match (&self.grab, self.scale) {
+                    (Grab::Ddagrab { .. } | Grab::Gdigrab { .. }, Some((w, h))) => format!("{w}:{h}:flags=bilinear:"),
+                    _ => String::new(),
+                };
+                chain.push(format!("scale={size}out_color_matrix=bt709:out_range=tv"));
                 chain.push(if family == Family::Software { "format=yuv420p" } else { "format=nv12" }.to_string());
+                // What the encoder is told comes from the frames; the
+                // conversion marks them with the matrix and range only.
+                chain.push("setparams=color_primaries=bt709:color_trc=bt709".to_string());
             }
         }
         (!chain.is_empty()).then(|| chain.join(","))
@@ -277,6 +301,13 @@ impl Video {
             }
             args.extend([key.to_string(), value]);
         }
+        if self.frames == Frames::Memory {
+            // What the filters made of the picture, for an ffmpeg that
+            // does not pass it on from the frames by itself. Frames kept
+            // on the graphics card are converted by the encoder, which
+            // says in its own way how; nothing is claimed for those here.
+            args.extend(words(&["-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709", "-color_range", "tv"]));
+        }
         args
     }
 }
@@ -288,13 +319,16 @@ pub fn capture_keeps_flowing(ffmpeg: &Path) -> bool {
     ask(ffmpeg, &["-h", "filter=gfxcapture"]).contains("dup_frames")
 }
 
-/// Every way of making the video worth trying, best first: for each
-/// encoder of the codec, each capture method, frames kept on the graphics
-/// card before frames downloaded.
+/// Every way of making the video worth trying, best first: every way that
+/// keeps the frames on the graphics card, encoder by encoder, before any
+/// that downloads them. Frames stay on the card only when the encoder is
+/// on the card the screen is on, so on a laptop with two the encoder of
+/// the one that owns the panel is found before another card's is settled
+/// for with every frame copied through memory.
 pub fn candidates(grabs: &[Grab], codec: Codec, scale: Option<(u32, u32)>, has: &Abilities) -> Vec<(Grab, Frames, Encoder)> {
     let mut out = Vec::new();
-    for encoder in encoders(codec).into_iter().filter(|e| has.encoders.contains(e.name)) {
-        for frames in [Frames::Gpu, Frames::Memory] {
+    for frames in [Frames::Gpu, Frames::Memory] {
+        for encoder in encoders(codec).into_iter().filter(|e| has.encoders.contains(e.name)) {
             for grab in grabs {
                 let fits = match (grab, frames, encoder.family) {
                     // A software encoder cannot read the graphics card.
@@ -429,8 +463,16 @@ pub fn join_args(list: &Path, out: &Path, codec: Codec) -> Vec<String> {
 /// gets no picture at all (a window that shows nothing new, a driver
 /// that hangs) would otherwise never end, and the recorder with it.
 pub const PROBE_LIMIT: Duration = Duration::from_secs(10);
-/// How long joining a clip may take: copying, so seconds even for a long one.
+/// How long joining a clip may take at the least: copying, so seconds
+/// for most.
 pub const JOIN_LIMIT: Duration = Duration::from_secs(120);
+
+/// How long joining pieces of `bytes` in all may take: the least, and the
+/// time to write them twice (the index is put in front once the clip is
+/// whole) to a disk that manages 20 MB a second.
+pub fn join_limit(bytes: u64) -> Duration {
+    JOIN_LIMIT + Duration::from_secs(bytes / 10_000_000)
+}
 
 /// Run ffmpeg to its end with nothing on stdin, for `limit` at the most.
 /// `Ok` when it succeeded, else the last thing it said; one that is not
@@ -443,6 +485,8 @@ pub fn run_quietly(ffmpeg: &Path, args: &[String], limit: Duration) -> Result<()
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|err| format!("ffmpeg could not be started: {err}"))?;
+    // A try or a join outlives this program as little as the recording does.
+    crate::sys::leash().hold(&child);
     // Read as it is written, so a talkative ffmpeg is never held up by a full pipe.
     let said = child.stderr.take().map(|mut stderr| {
         std::thread::spawn(move || {
@@ -505,6 +549,11 @@ mod tests {
         Abilities { version: String::new(), filters: HashSet::new(), encoders }
     }
 
+    /// The colours of a picture in memory turned into BT.709, limited range.
+    const TO_709: &str = "scale=out_color_matrix=bt709:out_range=tv";
+    const SAID_709: &str = "setparams=color_primaries=bt709:color_trc=bt709";
+    const TAGS_709: &str = "-color_primaries bt709 -color_trc bt709 -colorspace bt709 -color_range tv";
+
     const DDA: Grab = Grab::Ddagrab { output_idx: 1 };
     const GFX: Grab = Grab::Gfxcapture { hmonitor: 65537 };
 
@@ -539,14 +588,14 @@ mod tests {
         let mut v = video(DDA, Frames::Memory, enc(Codec::H264, Family::Software));
         v.cursor = false;
         assert_eq!(v.input()[3], "ddagrab=output_idx=1:framerate=60:draw_mouse=0,hwdownload,format=bgra");
-        assert_eq!(v.filters().as_deref(), Some("format=yuv420p"));
+        assert_eq!(v.filters().as_deref(), Some(&*format!("{TO_709},format=yuv420p,{SAID_709}")));
         assert!(v.encode().join(" ").starts_with("-c:v libx264 -preset ultrafast -b:v 20000k"));
         // A smaller picture is scaled once it is in memory.
         v.scale = Some((1920, 804));
-        assert_eq!(v.filters().as_deref(), Some("scale=1920:804:flags=bilinear,format=yuv420p"));
+        assert_eq!(v.filters().as_deref(), Some(&*format!("scale=1920:804:flags=bilinear:out_color_matrix=bt709:out_range=tv,format=yuv420p,{SAID_709}")));
         // A hardware encoder fed from memory takes NV12.
         v.encoder = enc(Codec::H264, Family::Amf);
-        assert_eq!(v.filters().as_deref(), Some("scale=1920:804:flags=bilinear,format=nv12"));
+        assert_eq!(v.filters().as_deref(), Some(&*format!("scale=1920:804:flags=bilinear:out_color_matrix=bt709:out_range=tv,format=nv12,{SAID_709}")));
     }
 
     #[test]
@@ -562,7 +611,7 @@ mod tests {
         v.frames = Frames::Memory;
         v.encoder = enc(Codec::Hevc, Family::Software);
         assert!(v.input()[3].ends_with(":resize_mode=scale,hwdownload,format=bgra"));
-        assert_eq!(v.filters().as_deref(), Some("fps=60,format=yuv420p"));
+        assert_eq!(v.filters().as_deref(), Some(&*format!("fps=60,{TO_709},format=yuv420p,{SAID_709}")));
     }
 
     #[test]
@@ -575,11 +624,11 @@ mod tests {
         v.frames = Frames::Memory;
         v.encoder = enc(Codec::H264, Family::Software);
         assert!(v.input()[3].ends_with(":resize_mode=scale_aspect,hwdownload,format=bgra"));
-        assert_eq!(v.filters().as_deref(), Some("fps=60,format=yuv420p"));
+        assert_eq!(v.filters().as_deref(), Some(&*format!("fps=60,{TO_709},format=yuv420p,{SAID_709}")));
         // On the graphics card for its encoders, downloaded for the rest.
         let tries = candidates(std::slice::from_ref(&grab), Codec::H264, None, &all_abilities());
         let shown: Vec<String> = tries.iter().map(|(_, f, e)| format!("{f:?} {}", e.name)).collect();
-        assert_eq!(shown, ["Gpu h264_nvenc", "Memory h264_nvenc", "Gpu h264_amf", "Memory h264_amf", "Gpu h264_qsv", "Memory h264_qsv", "Memory libx264"]);
+        assert_eq!(shown, ["Gpu h264_nvenc", "Gpu h264_amf", "Gpu h264_qsv", "Memory h264_nvenc", "Memory h264_amf", "Memory h264_qsv", "Memory libx264"]);
     }
 
     #[test]
@@ -594,9 +643,9 @@ mod tests {
         let grab = Grab::Gdigrab { origin: (-1920, 0), size: (1920, 1080) };
         let mut v = video(grab.clone(), Frames::Memory, enc(Codec::H264, Family::Software));
         assert_eq!(v.input().join(" "), "-f gdigrab -framerate 60 -draw_mouse 1 -offset_x -1920 -offset_y 0 -video_size 1920x1080 -i desktop");
-        assert_eq!(v.filters().as_deref(), Some("format=yuv420p"));
+        assert_eq!(v.filters().as_deref(), Some(&*format!("{TO_709},format=yuv420p,{SAID_709}")));
         v.scale = Some((1280, 720));
-        assert_eq!(v.filters().as_deref(), Some("scale=1280:720:flags=bilinear,format=yuv420p"));
+        assert_eq!(v.filters().as_deref(), Some(&*format!("scale=1280:720:flags=bilinear:out_color_matrix=bt709:out_range=tv,format=yuv420p,{SAID_709}")));
         // Never as frames on the graphics card, and after the better ways.
         let tries = candidates(&[DDA, grab.clone()], Codec::H264, None, &all_abilities());
         assert!(tries.iter().all(|(g, frames, _)| *g != grab || *frames == Frames::Memory));
@@ -608,7 +657,7 @@ mod tests {
         let mut v = video(Grab::Test { size: (320, 180) }, Frames::Memory, enc(Codec::H264, Family::Software));
         v.fps = 30;
         assert_eq!(v.input(), ["-re", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=30"]);
-        assert_eq!(v.filters().as_deref(), Some("format=yuv420p"));
+        assert_eq!(v.filters().as_deref(), Some(&*format!("{TO_709},format=yuv420p,{SAID_709}")));
     }
 
     #[test]
@@ -620,14 +669,14 @@ mod tests {
             [
                 "ddagrab Gpu h264_nvenc",
                 "gfxcapture Gpu h264_nvenc",
-                "ddagrab Memory h264_nvenc",
-                "gfxcapture Memory h264_nvenc",
                 "ddagrab Gpu h264_amf",
                 "gfxcapture Gpu h264_amf",
-                "ddagrab Memory h264_amf",
-                "gfxcapture Memory h264_amf",
                 "ddagrab Gpu h264_qsv",
                 "gfxcapture Gpu h264_qsv",
+                "ddagrab Memory h264_nvenc",
+                "gfxcapture Memory h264_nvenc",
+                "ddagrab Memory h264_amf",
+                "gfxcapture Memory h264_amf",
                 "ddagrab Memory h264_qsv",
                 "gfxcapture Memory h264_qsv",
                 "ddagrab Memory libx264",
@@ -637,11 +686,57 @@ mod tests {
     }
 
     #[test]
+    fn no_frames_are_downloaded_while_some_encoder_may_take_them_on_the_card() {
+        // A laptop whose panel is on the Intel card: NVENC cannot take its
+        // frames as they are, Quick Sync can, and is tried before NVENC is
+        // settled for with every frame copied through memory.
+        let pixels = Grab::Gdigrab { origin: (0, 0), size: (1920, 1080) };
+        for codec in Codec::ALL {
+            let tries = candidates(&[DDA, GFX, pixels.clone()], codec, None, &all_abilities());
+            let first_download = tries.iter().position(|(_, frames, _)| *frames == Frames::Memory).unwrap();
+            assert!(tries[first_download..].iter().all(|(_, frames, _)| *frames == Frames::Memory), "{codec:?}");
+            let on_the_card: Vec<Family> = tries[..first_download].iter().map(|(_, _, e)| e.family).collect();
+            assert_eq!(on_the_card, [Family::Nvenc, Family::Nvenc, Family::Amf, Family::Amf, Family::Qsv, Family::Qsv], "{codec:?}");
+            // No more tries than before, and the surest still last.
+            assert_eq!(tries.len(), 6 + 3 * 3 + 3);
+            assert_eq!(tries.last().map(|(g, _, e)| (g.clone(), e.family)), Some((pixels.clone(), Family::Software)));
+        }
+    }
+
+    #[test]
+    fn a_picture_converted_in_memory_is_bt709_and_says_so() {
+        let v = video(DDA, Frames::Memory, enc(Codec::H264, Family::Nvenc));
+        assert_eq!(v.filters().as_deref(), Some(&*format!("{TO_709},format=nv12,{SAID_709}")));
+        assert!(v.encode().join(" ").ends_with(&format!("-g 60 -bf 0 {TAGS_709}")));
+        // Frames kept on the card are converted by the encoder: nothing is
+        // put in their way, and nothing claimed for them.
+        let v = video(DDA, Frames::Gpu, enc(Codec::H264, Family::Nvenc));
+        assert_eq!(v.filters(), None);
+        assert!(!v.encode().join(" ").contains("color"));
+    }
+
+    #[test]
+    fn a_long_clip_is_given_longer_to_be_joined() {
+        assert_eq!(join_limit(0), JOIN_LIMIT);
+        assert_eq!(join_limit(450_000_000), JOIN_LIMIT + Duration::from_secs(45));
+        // Ten minutes at 100 Mbit/s.
+        assert!(join_limit(7_500_000_000) > Duration::from_secs(600));
+    }
+
+    #[test]
+    fn the_recording_ffmpeg_is_another_command_than_the_rest() {
+        // The priority itself is Windows' to give; the program is the same.
+        assert_eq!(recording_command(Path::new("ffmpeg")).get_program(), command(Path::new("ffmpeg")).get_program());
+    }
+
+    #[test]
     fn a_smaller_picture_is_not_tried_where_nothing_can_scale_it() {
         let tries = candidates(&[DDA, GFX], Codec::Hevc, Some((1280, 720)), &all_abilities());
         assert!(!tries.iter().any(|(g, f, _)| *g == DDA && *f == Frames::Gpu));
         assert_eq!(tries[0], (GFX, Frames::Gpu, enc(Codec::Hevc, Family::Nvenc)));
-        assert_eq!(tries[1], (DDA, Frames::Memory, enc(Codec::Hevc, Family::Nvenc)));
+        assert_eq!(tries[1], (GFX, Frames::Gpu, enc(Codec::Hevc, Family::Amf)));
+        let first_download = tries.iter().find(|(_, frames, _)| *frames == Frames::Memory);
+        assert_eq!(first_download, Some(&(DDA, Frames::Memory, enc(Codec::Hevc, Family::Nvenc))));
     }
 
     #[test]
@@ -687,7 +782,8 @@ mod tests {
         let v = video(DDA, Frames::Memory, enc(Codec::H264, Family::Software));
         let line = record_args(&v, 1, Path::new("ring"), 0, -80).join(" ");
         assert!(line.contains("-i ddagrab=output_idx=1:framerate=60:draw_mouse=1,hwdownload,format=bgra -itsoffset -0.080 -f f32le -ar 48000 -ac 2 -i pipe:0"), "{line}");
-        assert!(line.contains("-filter_complex [0:v]format=yuv420p[v] -map [v] -map 1:a -c:v libx264 -preset ultrafast"), "{line}");
+        assert!(line.contains(&format!("-filter_complex [0:v]{TO_709},format=yuv420p,{SAID_709}[v] -map [v] -map 1:a -c:v libx264 -preset ultrafast")), "{line}");
+        assert!(line.contains(&format!("-bf 0 {TAGS_709} -fps_mode cfr -r 60")), "{line}");
     }
 
     #[test]
@@ -710,8 +806,8 @@ mod tests {
         v.bitrate_kbps = 1000;
         let line = record_args(&v, 2, Path::new("r"), 0, 0).join(" ");
         assert!(line.starts_with("-hide_banner -nostdin -nostats -loglevel info -y -re -f lavfi -i testsrc2=size=320x180:rate=30 -f f32le"), "{line}");
-        assert!(line.contains("-filter_complex [0:v]format=yuv420p[v];[1:a]asplit=2"), "{line}");
-        assert!(line.contains("-g 30 -bf 0 -fps_mode cfr -r 30"), "{line}");
+        assert!(line.contains(&format!("-filter_complex [0:v]{TO_709},format=yuv420p,{SAID_709}[v];[1:a]asplit=2")), "{line}");
+        assert!(line.contains(&format!("-g 30 -bf 0 {TAGS_709} -fps_mode cfr -r 30")), "{line}");
     }
 
     #[test]
@@ -727,15 +823,17 @@ mod tests {
         let line = encoder_test_args(enc(Codec::Hevc, Family::Qsv)).join(" ");
         assert_eq!(
             line,
-            "-hide_banner -nostdin -nostats -loglevel error -y -f lavfi -i testsrc2=size=1280x720:rate=30 -vf format=nv12 \
-             -c:v hevc_qsv -b:v 4000k -maxrate 4000k -bufsize 4000k -g 30 -bf 0 -t 1 -f null -"
+            format!(
+                "-hide_banner -nostdin -nostats -loglevel error -y -f lavfi -i testsrc2=size=1280x720:rate=30 -vf {TO_709},format=nv12,{SAID_709} \
+                 -c:v hevc_qsv -b:v 4000k -maxrate 4000k -bufsize 4000k -g 30 -bf 0 {TAGS_709} -t 1 -f null -"
+            )
         );
     }
 
     #[test]
     fn the_software_av1_encoder_gets_no_ceiling() {
         let v = video(DDA, Frames::Memory, enc(Codec::Av1, Family::Software));
-        assert_eq!(v.encode().join(" "), "-c:v libsvtav1 -preset 12 -b:v 20000k -bufsize 20000k -g 60 -bf 0");
+        assert_eq!(v.encode().join(" "), format!("-c:v libsvtav1 -preset 12 -b:v 20000k -bufsize 20000k -g 60 -bf 0 {TAGS_709}"));
     }
 
     #[test]
@@ -748,6 +846,8 @@ mod tests {
     #[test]
     fn an_ffmpeg_that_is_not_done_in_time_is_ended() {
         if !Command::new("ffmpeg").arg("-version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success()) {
+            // Where the tests are run to prove something, a skip proves nothing.
+            assert!(std::env::var("ZENITH_REQUIRE_FFMPEG").as_deref() != Ok("1"), "ffmpeg is not installed, and ZENITH_REQUIRE_FFMPEG=1 says it has to be");
             println!("NOTE: skipped: ffmpeg is not installed");
             return;
         }

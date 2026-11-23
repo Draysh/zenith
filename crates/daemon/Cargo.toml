@@ -17,10 +17,14 @@ chrono.workspace = true
 tokio = { version = "1.54.1", features = ["rt", "macros", "process", "signal", "net", "time", "io-util", "sync"] }
 
 # Signals, the socket's owner, the tray icon and notifications with buttons.
+# zbus (the one the tray icon already brings) speaks to the desktop's
+# portal for the save hotkey, whose signals come as a stream.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.191"
 notify-rust = { version = "4.19.0", default-features = false, features = ["z"] }
 ksni = "0.3.7"
+zbus = { version = "5.19.0", default-features = false, features = ["tokio"] }
+futures-util = { version = "0.3", default-features = false }
 
 # Toasts, the save hotkey and the tray icon with the message loops they
 # need, the save sound, and the notice drawn over a game.

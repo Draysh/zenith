@@ -93,13 +93,16 @@ pub enum PlanError {
     TooLong { megabytes: u32, max_seconds: u32 },
 }
 
-/// A height's size for a picture shaped like `src`, with even sides.
+/// A height's size for a picture shaped like `src`, with even sides of at
+/// least two pixels: a side of one pixel (or none, from a file that could
+/// not be read well) would otherwise be asked of the encoder as 0.
 fn scaled(src: &Source, height: u32) -> (u32, u32) {
+    let even = |side: u32| side.max(2) & !1;
     if height >= src.height {
-        return (src.width & !1, src.height & !1);
+        return (even(src.width), even(src.height));
     }
-    let w = (src.width as f64 * height as f64 / src.height as f64).round() as u32;
-    (w.max(2) & !1, height & !1)
+    let w = (src.width as f64 * height as f64 / src.height.max(1) as f64).round() as u32;
+    (even(w), even(height))
 }
 
 /// The plan that fits `src` under `max_bytes`.
@@ -135,7 +138,8 @@ pub fn plan(src: Source, preset: Preset) -> Result<Plan, PlanError> {
         }
     }
     let (width, height, fps, per_kbit) = chosen.expect("there are steps");
-    let video_kbps = budget.min(per_kbit * MAX_BITS_PER_PIXEL).floor() as u32;
+    // (At least 1: a picture of a few pixels needs less than a whole kbit.)
+    let video_kbps = (budget.min(per_kbit * MAX_BITS_PER_PIXEL).floor() as u32).max(1);
     Ok(Plan { width, height, fps, video_kbps, audio_kbps })
 }
 
@@ -199,6 +203,17 @@ mod tests {
         let small = Source { width: 1280, height: 720, fps: 30.0, seconds: 5.0, has_audio: true };
         let p = plan(small, Preset::Nitro).unwrap();
         assert_eq!((p.width, p.height, p.fps), (1280, 720, 30.0));
+    }
+
+    #[test]
+    fn the_smallest_picture_is_two_pixels_a_side() {
+        for (width, height) in [(1, 1), (1, 1080), (1920, 1), (0, 0), (3, 5), (4000, 3)] {
+            for seconds in [1.0, 60.0, 600.0] {
+                let p = plan(Source { width, height, fps: 60.0, seconds, has_audio: true }, Preset::Discord).unwrap();
+                assert!(p.width >= 2 && p.height >= 2 && p.width.is_multiple_of(2) && p.height.is_multiple_of(2), "{width}x{height} {seconds}s: {p:?}");
+                assert!(p.video_kbps >= 1, "{p:?}");
+            }
+        }
     }
 
     #[test]

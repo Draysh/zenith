@@ -137,6 +137,9 @@ pub struct Library {
     /// Files a probe refused, with the size and time they had then: they
     /// are not read again until they change.
     refused: std::cell::RefCell<std::collections::HashMap<PathBuf, (u64, Option<std::time::SystemTime>)>>,
+    /// Where what could not be read of a clip is put before it is written
+    /// over (see `keep_what_cannot_be_read`): beside the index.
+    unread: Option<PathBuf>,
 }
 
 /// The layout of the index. An older index is moved up to it when it is
@@ -186,7 +189,15 @@ const COLUMNS: &str = "id, path, game, title, saved_at, seconds, width, height, 
 /// all, and the version is read after the index is locked: the recorder
 /// and the window may both open an old index at the same moment, and the
 /// second one must find the work done.
+///
+/// An index that has the newest layout already is not locked at all: every
+/// window and every rescan opens it, and none of them should wait for, or
+/// be refused by, whoever is writing to it at that moment.
 fn migrate(db: &Connection) -> Result<i64> {
+    let found: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if found >= SCHEMA_VERSION {
+        return Ok(found);
+    }
     let all = rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate)?;
     all.execute_batch(SCHEMA_V1)?;
     let found: i64 = all.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -243,20 +254,22 @@ fn clip(row: &rusqlite::Row) -> rusqlite::Result<Clip> {
     let tracks: String = row.get(11)?;
     let edit: Option<String> = row.get(12)?;
     let tags: String = row.get(13)?;
+    let seconds: f64 = row.get(5)?;
     Ok(Clip {
         id: row.get(0)?,
         path,
         game: row.get(2)?,
         title,
         saved_at: row.get(4)?,
-        seconds: row.get(5)?,
+        seconds,
         width: row.get(6)?,
         height: row.get(7)?,
         fps: row.get(8)?,
         bytes: row.get::<_, i64>(9)? as u64,
         favorite: row.get(10)?,
         tracks: serde_json::from_str(&tracks).unwrap_or_default(),
-        edit: edit.and_then(|e| serde_json::from_str(&e).ok()),
+        // What is kept is not trusted as it is: see `Edit::fitted`.
+        edit: edit.and_then(|e| serde_json::from_str::<Edit>(&e).ok()).and_then(|e| e.fitted(seconds)),
         tags: serde_json::from_str(&tags).unwrap_or_default(),
         notes: row.get(14)?,
     })
@@ -270,19 +283,41 @@ impl Library {
         }
         let db = Connection::open(file)?;
         keep_a_copy_before_moving_up(&db, file);
-        Self::with(db)
+        Self::with(db, Some(file.with_extension("unread.jsonl")))
     }
 
     pub fn in_memory() -> Result<Self> {
-        Self::with(Connection::open_in_memory()?)
+        Self::with(Connection::open_in_memory()?, None)
     }
 
-    fn with(db: Connection) -> Result<Self> {
+    fn with(db: Connection, unread: Option<PathBuf>) -> Result<Self> {
         // The daemon writes while the app reads.
         db.pragma_update(None, "journal_mode", "WAL")?;
         db.busy_timeout(std::time::Duration::from_secs(5))?;
         migrate(&db)?;
-        Ok(Self { db, refused: Default::default() })
+        Ok(Self { db, refused: Default::default(), unread })
+    }
+
+    /// Called before a clip's edit or tags are written over. What is kept
+    /// there now may be something this Zenith cannot read (written by a
+    /// newer one, or damaged): the clip then shows as having none, and the
+    /// next change would replace it for good. It is put in a file beside
+    /// the index first (`library.unread.jsonl`, a line each), so it can be
+    /// looked at and put back. The write itself goes ahead either way:
+    /// a clip that could never be edited again would be the worse loss.
+    fn keep_what_cannot_be_read(&self, id: i64, column: &str, reads: impl Fn(&str) -> bool) {
+        let Some(file) = &self.unread else { return };
+        let kept = self.db.query_row(&format!("SELECT path, {column} FROM clips WHERE id = ?1"), [id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)));
+        let Ok((path, Some(text))) = kept else { return };
+        if reads(&text) {
+            return;
+        }
+        let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let line = serde_json::json!({ "clip": id, "path": path, "what": column, "was": text, "at": at });
+        if let Ok(mut out) = std::fs::OpenOptions::new().create(true).append(true).open(file) {
+            use std::io::Write;
+            let _ = writeln!(out, "{line}");
+        }
     }
 
     /// Add a clip file, or bring its details up to date. What the user set
@@ -366,6 +401,7 @@ impl Library {
     /// Keep a clip's edit; `None` clears it, and the clip is one not edited yet.
     pub fn set_edit(&self, id: i64, edit: Option<&Edit>) -> Result<()> {
         let json = edit.map(|e| serde_json::to_string(e).expect("an edit serializes"));
+        self.keep_what_cannot_be_read(id, "edit", |kept| serde_json::from_str::<Edit>(kept).is_ok());
         self.db.execute("UPDATE clips SET edit = ?2 WHERE id = ?1", params![id, json])?;
         Ok(())
     }
@@ -388,6 +424,7 @@ impl Library {
     /// The tags a clip has, replacing the ones it had.
     pub fn set_tags(&self, id: i64, tags: &[String]) -> Result<()> {
         let tags = serde_json::to_string(&tags_from(&tags.join(","))).unwrap_or_else(|_| "[]".into());
+        self.keep_what_cannot_be_read(id, "tags", |kept| serde_json::from_str::<Vec<String>>(kept).is_ok());
         self.db.execute("UPDATE clips SET tags = ?2 WHERE id = ?1", params![id, tags])?;
         Ok(())
     }
@@ -495,7 +532,11 @@ impl Library {
         }
         // The same file under a name that differs only in its capitals is
         // not a name that is taken, where capitals do not count.
-        let same = wanted.parent() == from.parent() && wanted.file_name().zip(from.file_name()).is_some_and(|(a, b)| a.eq_ignore_ascii_case(b));
+        // Where capitals do count, that name may be another clip's file,
+        // and a rename onto it would replace it.
+        let same = wanted.parent() == from.parent()
+            && wanted.file_name().zip(from.file_name()).is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
+            && (!wanted.exists() || same_file(from, wanted));
         let target = if same { wanted.to_path_buf() } else { super::free_path(wanted) };
         std::fs::rename(from, &target)?;
         if let Err(e) = self.db.execute("UPDATE clips SET path = ?2 WHERE id = ?1", params![id, target.to_string_lossy()]) {
@@ -519,15 +560,24 @@ impl Library {
     ///
     /// A folder that cannot be read (a drive that is not plugged in) says
     /// nothing about its clips, so nothing is changed then: the index is
-    /// the only place a clip's name, favourite and edit are kept.
+    /// the only place a clip's name, favourite and edit are kept. For the
+    /// same reason a clip is only forgotten when the place its file was in
+    /// can be looked into and the file is not there (see `says_gone`).
+    ///
+    /// The index is read, then the files are looked at with nothing held,
+    /// then what was found is written in one short go. Reading a new file
+    /// takes a moment each (`probe` runs ffprobe), and the first look at a
+    /// large folder takes minutes of them: the recorder must be able to add
+    /// the clip it has just saved all through that.
     pub fn rescan(&self, dir: &Path, probe: impl Fn(&Path) -> std::result::Result<Meta, ProbeError>) -> Result<Changes> {
-        if std::fs::read_dir(dir).is_err() {
+        let Ok(mut entries) = std::fs::read_dir(dir) else {
             return Ok(Changes::default());
-        }
+        };
+        // A clip folder with nothing in it at all is what is left where a
+        // drive was mounted: someone who deleted their clips has the
+        // games' folders still.
+        let bare = entries.next().is_none();
         let on_disk = super::files(dir);
-        let mut changes = Changes::default();
-        // One write to the index, however many clips changed.
-        let all = self.db.unchecked_transaction()?;
         let known: Vec<(i64, PathBuf, u64)> = {
             let mut stmt = self.db.prepare("SELECT id, path, bytes FROM clips")?;
             stmt.query_map([], |r| Ok((r.get(0)?, PathBuf::from(r.get::<_, String>(1)?), r.get::<_, i64>(2)? as u64)))?
@@ -535,18 +585,18 @@ impl Library {
         };
         let indexed: std::collections::HashSet<&Path> = known.iter().map(|(_, path, _)| path.as_path()).collect();
         // Clips whose file is not where it was, until a new file claims one.
-        let mut gone: Vec<(i64, u64)> = known.iter().filter(|(_, path, _)| !path.is_file()).map(|(id, _, bytes)| (*id, *bytes)).collect();
+        let mut gone: Vec<(i64, &Path, u64)> = known.iter().filter(|(_, path, _)| !path.is_file()).map(|(id, path, bytes)| (*id, path.as_path(), *bytes)).collect();
+        // What there is to write: clips whose file has a new place (from,
+        // to), and files that are new.
+        let mut moved: Vec<(i64, &Path, &Path)> = Vec::new();
+        let mut found: Vec<(&Path, Meta)> = Vec::new();
         for file in on_disk.iter().filter(|file| !indexed.contains(file.as_path())) {
             // The same number of bytes under a new name is the file that went missing.
             let stamp = std::fs::metadata(file).map(|m| (m.len(), m.modified().ok())).unwrap_or((0, None));
             let size = stamp.0;
-            if let Some(at) = gone.iter().position(|(_, bytes)| size > 0 && *bytes == size) {
-                let (id, _) = gone.remove(at);
-                self.db.execute(
-                    "UPDATE clips SET path = ?2, game = ?3 WHERE id = ?1",
-                    params![id, file.to_string_lossy(), super::game_of(dir, file)],
-                )?;
-                changes.moved += 1;
+            if let Some(at) = gone.iter().position(|(_, _, bytes)| size > 0 && *bytes == size) {
+                let (id, from, _) = gone.remove(at);
+                moved.push((id, from, file));
                 continue;
             }
             // Refused before and not changed since: it would be refused again.
@@ -558,15 +608,87 @@ impl Library {
                 continue;
             };
             self.refused.borrow_mut().remove(file);
+            found.push((file, meta));
+        }
+        let forgotten: Vec<(i64, &Path)> = gone.into_iter().filter(|(_, path, _)| says_gone(dir, bare, path)).map(|(id, path, _)| (id, path)).collect();
+        let mut changes = Changes::default();
+        if moved.is_empty() && found.is_empty() && forgotten.is_empty() {
+            // Nothing to write: the index is not locked at all.
+            return Ok(changes);
+        }
+        // One write to the index, however many clips changed. It is taken
+        // as a write from its start, so it waits its turn behind another
+        // writer instead of failing halfway. Every row is looked at again
+        // as it is written: the recorder or another window may have changed
+        // it since it was read above.
+        let all = rusqlite::Transaction::new_unchecked(&self.db, rusqlite::TransactionBehavior::Immediate)?;
+        for (id, from, to) in moved {
+            // Only a clip that is still where it was read to be, and only
+            // to a name no clip has taken meanwhile.
+            let done = self.db.execute(
+                "UPDATE OR IGNORE clips SET path = ?3, game = ?4 WHERE id = ?1 AND path = ?2",
+                params![id, from.to_string_lossy(), to.to_string_lossy(), super::game_of(dir, to)],
+            )?;
+            changes.moved += done as u32;
+        }
+        for (file, meta) in found {
+            // Added meanwhile by the recorder, which knows more about it
+            // (its tracks, when it was saved) than can be read from the file.
+            let there: bool = self.db.query_row("SELECT EXISTS (SELECT 1 FROM clips WHERE path = ?1)", [file.to_string_lossy()], |r| r.get(0))?;
+            if there {
+                continue;
+            }
             self.add_found(file, &super::game_of(dir, file), super::saved_at(file), &meta)?;
             changes.added += 1;
         }
-        for (id, _) in gone {
-            self.forget(id)?;
-            changes.removed += 1;
+        for (id, path) in forgotten {
+            // A file that is back, or a clip that points somewhere else
+            // now, is not forgotten.
+            if path.is_file() {
+                continue;
+            }
+            changes.removed += self.db.execute("DELETE FROM clips WHERE id = ?1 AND path = ?2", params![id, path.to_string_lossy()])? as u32;
         }
         all.commit()?;
         Ok(changes)
+    }
+}
+
+/// Whether a clip's file not being at `path` means the clip is gone, and
+/// not only out of reach. `dir` is the clip folder, `bare` whether it has
+/// nothing in it at all.
+fn says_gone(dir: &Path, bare: bool, path: &Path) -> bool {
+    let Some(folder) = path.parent() else { return false };
+    if path.starts_with(dir) {
+        // An empty clip folder is a drive that is not there. A folder that
+        // is there but cannot be looked into (not allowed) says nothing; one
+        // that is not there any more was deleted with its clips.
+        !bare && (!folder.exists() || std::fs::read_dir(folder).is_ok())
+    } else {
+        // A clip from another clip folder, kept from before: gone when the
+        // folder it was in is still there without it. That folder missing
+        // too is a drive that is not plugged in.
+        std::fs::read_dir(folder).is_ok()
+    }
+}
+
+/// Whether two names are the same file (where capitals do not count, a
+/// file answers to its name in any capitals).
+fn same_file(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::metadata(a), std::fs::metadata(b)) {
+            (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        }
     }
 }
 
@@ -666,7 +788,7 @@ mod tests {
         db.pragma_update(None, "journal_mode", "WAL").unwrap();
         db.execute_batch(SCHEMA_V1).unwrap();
         db.pragma_update(None, "user_version", 1).unwrap();
-        let mut edit = Edit::new(45.0, 1);
+        let mut edit = Edit::new(30.5, 2);
         edit.split(10.0);
         let tracks = serde_json::to_string(&[Track::Game, Track::Chat]).unwrap();
         for n in 1..=40i64 {
@@ -951,10 +1073,10 @@ mod tests {
         let mut edit = Edit::new(45.0, 1);
         edit.split(10.0);
         lib.set_edit(id, Some(&edit)).unwrap();
-        let again = lib.add(Path::new("/c/Dota 2/Dota 2 2026-11-03 10-00-00.mp4"), "Dota 2", 999, &meta(45.5), &[]).unwrap();
+        let again = lib.add(Path::new("/c/Dota 2/Dota 2 2026-11-03 10-00-00.mp4"), "Dota 2", 999, &meta(45.25), &[]).unwrap();
         assert_eq!(again, id);
         let clip = lib.get(id).unwrap().unwrap();
-        assert_eq!((clip.title.as_str(), clip.favorite, clip.seconds, clip.saved_at), ("Rampage", true, 45.5, 300));
+        assert_eq!((clip.title.as_str(), clip.favorite, clip.seconds, clip.saved_at), ("Rampage", true, 45.25, 300));
         assert_eq!(clip.edit, Some(edit));
         assert_eq!(lib.list(&Filter { favorites: true, ..Default::default() }).unwrap().len(), 1);
         lib.set_title(id, " ").unwrap();
@@ -1015,6 +1137,96 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_clip_folder_is_a_drive_that_is_not_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().join("Clips");
+        std::fs::create_dir_all(d.join("Hades")).unwrap();
+        std::fs::write(d.join("Hades/a.mp4"), b"video").unwrap();
+        std::fs::write(d.join("Hades/b.mp4"), b"another").unwrap();
+        let lib = Library::open(&dir.path().join("library.db")).unwrap();
+        lib.rescan(&d, real_size).unwrap();
+        let id = lib.list(&Filter::default()).unwrap()[0].id;
+        lib.set_title(id, "Kept").unwrap();
+        // Unmounted: the folder it was mounted on is there, with nothing in it.
+        let away = dir.path().join("away");
+        std::fs::rename(&d, &away).unwrap();
+        std::fs::create_dir(&d).unwrap();
+        assert_eq!(lib.rescan(&d, real_size).unwrap(), Changes::default());
+        assert_eq!(lib.list(&Filter::default()).unwrap().len(), 2);
+        std::fs::remove_dir(&d).unwrap();
+        std::fs::rename(&away, &d).unwrap();
+        assert_eq!(lib.rescan(&d, real_size).unwrap(), Changes::default());
+        assert_eq!(lib.get(id).unwrap().unwrap().title, "Kept");
+        // Deleted by hand, the game's folder still there: those are gone.
+        std::fs::remove_file(d.join("Hades/a.mp4")).unwrap();
+        std::fs::remove_file(d.join("Hades/b.mp4")).unwrap();
+        assert_eq!(lib.rescan(&d, real_size).unwrap().removed, 2);
+    }
+
+    #[test]
+    fn a_clip_from_another_clip_folder_is_kept_while_that_folder_is_away() {
+        let dir = tempfile::tempdir().unwrap();
+        let (old, new) = (dir.path().join("Old"), dir.path().join("New"));
+        std::fs::create_dir_all(old.join("Hades")).unwrap();
+        std::fs::create_dir_all(new.join("Celeste")).unwrap();
+        std::fs::write(old.join("Hades/a.mp4"), b"from before").unwrap();
+        std::fs::write(new.join("Celeste/b.mp4"), b"new").unwrap();
+        let lib = Library::open(&dir.path().join("library.db")).unwrap();
+        lib.rescan(&old, real_size).unwrap();
+        lib.rescan(&new, real_size).unwrap();
+        assert_eq!(lib.list(&Filter::default()).unwrap().len(), 2);
+        // The old folder's drive is unplugged.
+        let away = dir.path().join("away");
+        std::fs::rename(&old, &away).unwrap();
+        assert_eq!(lib.rescan(&new, real_size).unwrap(), Changes::default());
+        // Back, and the clip deleted from it: now it is gone.
+        std::fs::rename(&away, &old).unwrap();
+        std::fs::remove_file(old.join("Hades/a.mp4")).unwrap();
+        assert_eq!(lib.rescan(&new, real_size).unwrap().removed, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_that_may_not_be_looked_into_forgets_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        std::fs::create_dir_all(d.join("Hades")).unwrap();
+        std::fs::create_dir_all(d.join("Celeste")).unwrap();
+        std::fs::write(d.join("Hades/a.mp4"), b"video").unwrap();
+        std::fs::write(d.join("Celeste/b.mp4"), b"another").unwrap();
+        let lib = Library::open(&d.join("library.db")).unwrap();
+        lib.rescan(d, real_size).unwrap();
+        let shut = |mode| std::fs::set_permissions(d.join("Hades"), std::fs::Permissions::from_mode(mode)).unwrap();
+        shut(0o000);
+        // Whoever may read everything (root) is not shut out by this.
+        if std::fs::read_dir(d.join("Hades")).is_err() {
+            assert_eq!(lib.rescan(d, real_size).unwrap(), Changes::default());
+        }
+        shut(0o755);
+        assert_eq!(lib.list(&Filter::default()).unwrap().len(), 2);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_new_name_in_other_capitals_does_not_replace_another_clip() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        std::fs::create_dir_all(d.join("Hades")).unwrap();
+        std::fs::write(d.join("Hades/Ace.mp4"), b"the first").unwrap();
+        std::fs::write(d.join("Hades/ace.mp4"), b"the second one").unwrap();
+        let lib = Library::open(&d.join("index/library.db")).unwrap();
+        lib.rescan(d, real_size).unwrap();
+        let first = lib.list(&Filter::default()).unwrap().into_iter().find(|c| c.path.ends_with("Ace.mp4")).unwrap().id;
+        let now = lib.rename_file(first, "ace").unwrap();
+        assert_eq!(now, d.join("Hades/ace (2).mp4"));
+        assert_eq!(std::fs::read(&now).unwrap(), b"the first");
+        assert_eq!(std::fs::read(d.join("Hades/ace.mp4")).unwrap(), b"the second one");
+        // Its own name in other capitals is still just a rename.
+        assert_eq!(lib.rename_file(first, "ACE (2)").unwrap(), d.join("Hades/ACE (2).mp4"));
+    }
+
+    #[test]
     fn a_moved_file_is_still_the_same_clip() {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path();
@@ -1033,6 +1245,106 @@ mod tests {
         assert_eq!((clip.title.as_str(), clip.favorite, clip.game.as_str()), ("Ace", true, "Best of"));
         assert_eq!(clip.path, d.join("Best of/renamed.mp4"));
         assert_eq!(lib.list(&Filter::default()).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn the_recorder_can_add_a_clip_while_a_rescan_reads_new_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        std::fs::create_dir_all(d.join("Hades")).unwrap();
+        std::fs::write(d.join("Hades/a.mp4"), b"one").unwrap();
+        std::fs::write(d.join("Hades/b.mp4"), b"another").unwrap();
+        std::fs::write(d.join("Hades/saved.mp4"), b"just saved").unwrap();
+        let index = dir.path().join("index/library.db");
+        let lib = Library::open(&index).unwrap();
+        // The recorder has the index open too. It does not wait long here,
+        // so that being kept out shows as a failure and not as a slow test.
+        let recorder = Library::open(&index).unwrap();
+        recorder.db.busy_timeout(std::time::Duration::from_millis(100)).unwrap();
+        let adds = std::cell::Cell::new(0);
+        let probe = |p: &Path| {
+            // While each file is read, the recorder files the clip it saved.
+            recorder.add(&d.join("Hades/saved.mp4"), "Hades", 500, &meta(20.0), &[Track::Game]).unwrap();
+            adds.set(adds.get() + 1);
+            real_size(p)
+        };
+        assert_eq!(lib.rescan(d, probe).unwrap(), Changes { added: 2, ..Default::default() }, "the one the recorder added is its own");
+        assert_eq!(adds.get(), 3);
+        let clips = lib.list(&Filter::default()).unwrap();
+        assert_eq!(clips.len(), 3);
+        let saved = clips.iter().find(|c| c.path.ends_with("saved.mp4")).unwrap();
+        assert_eq!((saved.saved_at, saved.seconds, saved.tracks.as_slice()), (500, 20.0, &[Track::Game][..]), "as the recorder knows it");
+        assert_eq!(lib.rescan(d, probe).unwrap(), Changes::default());
+    }
+
+    #[test]
+    fn a_rescan_with_nothing_to_write_and_an_open_wait_for_no_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        std::fs::create_dir_all(d.join("Hades")).unwrap();
+        std::fs::write(d.join("Hades/a.mp4"), b"one").unwrap();
+        let index = dir.path().join("index/library.db");
+        let lib = Library::open(&index).unwrap();
+        lib.rescan(d, real_size).unwrap();
+        // Someone is in the middle of a write to the index.
+        let writer = Connection::open(&index).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE; UPDATE clips SET notes = 'being written'").unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(lib.rescan(d, real_size).unwrap(), Changes::default());
+        let window = Library::open(&index).unwrap();
+        assert_eq!(window.list(&Filter::default()).unwrap().len(), 1);
+        assert!(started.elapsed() < std::time::Duration::from_secs(3), "neither waited for the lock");
+        writer.execute_batch("COMMIT").unwrap();
+        assert_eq!(window.list(&Filter::default()).unwrap()[0].notes, "being written");
+    }
+
+    #[test]
+    fn a_kept_edit_that_does_not_fit_the_file_is_not_handed_out() {
+        let lib = library();
+        let id = lib.list(&Filter::default()).unwrap()[0].id;
+        let kept = |json: &str| {
+            lib.db.execute("UPDATE clips SET edit = ?2 WHERE id = ?1", params![id, json]).unwrap();
+            lib.get(id).unwrap().unwrap().edit
+        };
+        // Stretches that would make a trim panic are put right as it is read.
+        let mut edit = kept(r#"{"duration":45.0,"segments":[{"start":44.99,"end":45.0},{"start":80.0,"end":20.0}],"gains":[{"volume":1.0,"muted":false}]}"#).unwrap();
+        assert_eq!(edit, Edit::new(45.0, 1));
+        edit.trim_end(0.0);
+        edit.trim_start(45.0);
+        // The file was replaced by a shorter one: the edit was of the other.
+        let mut long = Edit::new(45.0, 1);
+        long.trim_start(40.0);
+        lib.set_edit(id, Some(&long)).unwrap();
+        assert_eq!(lib.get(id).unwrap().unwrap().edit, Some(long));
+        lib.add(Path::new("/c/Dota 2/Dota 2 2026-11-03 10-00-00.mp4"), "Dota 2", 300, &meta(12.0), &[Track::Game]).unwrap();
+        let clip = lib.get(id).unwrap().unwrap();
+        assert_eq!((clip.seconds, clip.edit), (12.0, None));
+    }
+
+    #[test]
+    fn what_cannot_be_read_of_a_clip_is_kept_aside_before_it_is_written_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let (lib, id, edit) = one_clip(d);
+        let aside = d.join("index/library.unread.jsonl");
+        // What reads is simply replaced.
+        lib.set_edit(id, Some(&edit)).unwrap();
+        lib.set_tags(id, &["again".into()]).unwrap();
+        assert!(!aside.exists());
+        // An edit and tags as a newer Zenith might keep them.
+        let newer = r#"{"version":9,"cuts":[[0,4]]}"#;
+        lib.db.execute("UPDATE clips SET edit = ?2, tags = 'boss, flawless' WHERE id = ?1", params![id, newer]).unwrap();
+        let clip = lib.get(id).unwrap().unwrap();
+        assert_eq!((clip.edit, clip.tags.len()), (None, 0), "shown as a clip with neither");
+        lib.set_edit(id, Some(&edit)).unwrap();
+        lib.add_tags(&[id], &["new".into()]).unwrap();
+        let clip = lib.get(id).unwrap().unwrap();
+        assert_eq!((clip.edit, clip.tags.as_slice()), (Some(edit), &["new".to_string()][..]), "the clip can be worked on again");
+        let lines: Vec<serde_json::Value> = std::fs::read_to_string(&aside).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!((lines[0]["clip"].as_i64(), lines[0]["what"].as_str(), lines[0]["was"].as_str()), (Some(id), Some("edit"), Some(newer)));
+        assert_eq!((lines[1]["what"].as_str(), lines[1]["was"].as_str()), (Some("tags"), Some("boss, flawless")));
+        assert!(lines[0]["path"].as_str().unwrap().ends_with("Hades 2026-11-20 21-04-33.mp4"));
     }
 
     #[test]

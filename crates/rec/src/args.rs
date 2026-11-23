@@ -7,7 +7,7 @@ use std::path::PathBuf;
 pub const USAGE: &str = "usage: zenith-rec -w <monitor|screen> -f <fps> [-s <W>x<H>] -k <h264|hevc|av1> -q <kbps> \
 -r <seconds> [-cursor yes|no] [-a <source>]... [-game-dir <folder>]... [-game-program <name>]... [-wait-for-game yes|no] -o <directory>
        zenith-rec --list-capture-options | --list-audio-devices | --info | --diagnose
-While recording, `save` on stdin writes a clip and prints its path; `stop` or the end of stdin ends it.";
+While recording, `save` on stdin writes a clip and prints its path, or `save-failed: <why>` when it cannot; `stop` or the end of stdin ends it.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Codec {
@@ -37,6 +37,12 @@ impl Codec {
             _ => Self::H264,
         }
     }
+
+    /// Whether a `-k` value asks for HDR or 10 bits, which this recorder
+    /// does not make: it records the plain codec, and says so in its log.
+    fn asks_for_more(value: &str) -> bool {
+        value.ends_with("_hdr") || value.ends_with("_10bit")
+    }
 }
 
 /// What to record and where the clips go.
@@ -48,6 +54,9 @@ pub struct Options {
     /// The size of the picture when it is not the monitor's own.
     pub size: Option<(u32, u32)>,
     pub codec: Codec,
+    /// HDR or 10 bits were asked for (`hevc_hdr`, `av1_10bit`), and are
+    /// not recorded: the picture is the codec's plain 8 bits.
+    pub hdr_asked: bool,
     pub bitrate_kbps: u32,
     /// How many seconds a clip reaches back.
     pub buffer_secs: u32,
@@ -120,6 +129,7 @@ pub fn parse(args: &[String]) -> Result<Command, ArgError> {
         fps: 60,
         size: None,
         codec: Codec::H264,
+        hdr_asked: false,
         bitrate_kbps: 8000,
         buffer_secs: 30,
         cursor: true,
@@ -140,7 +150,10 @@ pub fn parse(args: &[String]) -> Result<Command, ArgError> {
             "-w" => o.window = value.clone(),
             "-f" => o.fps = number("-f", value, 1..=240)?,
             "-s" => o.size = Some(size(value)?),
-            "-k" => o.codec = Codec::from_arg(value),
+            "-k" => {
+                o.codec = Codec::from_arg(value);
+                o.hdr_asked = Codec::asks_for_more(value);
+            }
             "-q" => o.bitrate_kbps = number("-q", value, 100..=500_000)?,
             "-r" => o.buffer_secs = number("-r", value, 2..=86_400)?,
             "-cursor" => o.cursor = value != "no",
@@ -239,6 +252,19 @@ mod tests {
         assert_eq!(record("-k hevc_hdr -o /c").codec, Codec::Hevc);
         assert_eq!(record("-k av1_10bit -o /c").codec, Codec::Av1);
         assert_eq!(record("-k auto -o /c").codec, Codec::H264);
+    }
+
+    #[test]
+    fn asking_for_hdr_is_remembered_so_it_can_be_said_that_there_is_none() {
+        assert!(record("-k hevc_hdr -o /c").hdr_asked);
+        assert!(record("-k hevc_10bit -o /c").hdr_asked);
+        assert!(record("-k av1_hdr -o /c").hdr_asked);
+        assert!(record("-k av1_10bit -o /c").hdr_asked);
+        for plain in ["h264", "hevc", "av1", "auto"] {
+            assert!(!record(&format!("-k {plain} -o /c")).hdr_asked, "{plain}");
+        }
+        // The last `-k` is the one that counts.
+        assert!(!record("-k hevc_hdr -k hevc -o /c").hdr_asked);
     }
 
     #[test]

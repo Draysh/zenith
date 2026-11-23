@@ -5,7 +5,9 @@
 # (copies $FAKE_GSR_SAMPLE into the -o directory and prints its path), the
 # line "stop" or its input closing ends it. Signals mean nothing to it, as
 # there are none on Windows. Why it ended is written to $FAKE_REC_ENDED.
-# FAKE_GSR_MODE changes its behaviour: deaf (ignore "save"), or unset (work).
+# FAKE_GSR_MODE changes its behaviour: deaf (ignore "save"), failing (answer
+# "save" with the line that says the clip could not be written), or unset
+# (work).
 out=""
 [ "$1" = --list-capture-options ] && { echo "DP-1|2560x1440"; echo "portal"; exit 0; }
 [ "$1" = --list-audio-devices ] && { echo "default_output|Default output"; echo "default_input|Default input"; exit 0; }
@@ -22,6 +24,7 @@ while IFS= read -r line; do
     case "$line" in
         save)
             [ "$FAKE_GSR_MODE" = deaf ] && continue
+            [ "$FAKE_GSR_MODE" = failing ] && { echo "save-failed: the pieces could not be joined"; continue; }
             n=$((n + 1))
             file="$out/Replay_$(date +%Y-%m-%d_%H-%M-%S)_$n.mp4"
             cp "$FAKE_GSR_SAMPLE" "$file" && echo "$file"

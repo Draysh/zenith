@@ -1,5 +1,12 @@
 //! What the daemon is asked over its socket: one JSON request on a line,
 //! one JSON response on a line.
+//!
+//! The app and the daemon are updated together but not restarted together,
+//! so for a while after an update one may be talking to an older or newer
+//! other. Nothing here is numbered: a field that is not known is passed
+//! over, one that is missing takes its default, and a request or response
+//! of a kind the reader does not know is told apart from nonsense and
+//! reported as coming from another version. `Status::version` says which.
 
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -29,7 +36,10 @@ pub enum Response {
     Error { message: String },
 }
 
+// Every field has a default, so a status from another version that lacks
+// one is still read.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(default)]
 pub struct Status {
     /// `idle`, `capturing`, `saving`, `restarting` or `failed`.
     pub state: String,
@@ -40,8 +50,24 @@ pub struct Status {
     pub buffer_secs: u32,
     pub clips_saved: u32,
     /// How it is recording, while it is: the capture method and encoder.
-    #[serde(default)]
     pub recording: Option<String>,
+    /// The daemon's version. Empty from a daemon too old to say.
+    pub version: String,
+    /// The save hotkey the daemon has: the combination it holds itself
+    /// (Windows), or the one the desktop bound for it (Linux), as the
+    /// desktop describes it.
+    pub hotkey: Option<String>,
+    /// Why the desktop gives no save hotkey, where it gives none (Linux):
+    /// `zenithd save` has to be bound to a key by hand then.
+    pub hotkey_missing: Option<String>,
+}
+
+impl Status {
+    /// Whether this status is from a daemon of another version than
+    /// `mine`: the one left running across an update, most likely.
+    pub fn other_version(&self, mine: &str) -> bool {
+        self.version != mine
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -52,6 +78,26 @@ pub enum IpcError {
     Io(#[from] std::io::Error),
     #[error("the daemon's answer was not understood: {0}")]
     Protocol(#[from] serde_json::Error),
+    /// A proper answer, of a kind this version does not know.
+    #[error("the recorder is a different version of Zenith and answered \"{0}\", which this one does not know: restart the recorder")]
+    OtherVersion(String),
+}
+
+/// What kind of message a line that could not be read claims to be: the
+/// text under `tag` (`request` or `response`), when the line is a JSON
+/// object with one. That is a message from another version of Zenith,
+/// which is something else than a line of nonsense.
+pub fn kind_of(line: &str, tag: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    Some(value.as_object()?.get(tag)?.as_str()?.to_string())
+}
+
+/// Read the daemon's answer.
+fn read_answer(answer: &str) -> Result<Response, IpcError> {
+    serde_json::from_str(answer).map_err(|e| match kind_of(answer, "response") {
+        Some(kind) => IpcError::OtherVersion(kind),
+        None => IpcError::Protocol(e),
+    })
 }
 
 /// The longest answer that is read: the daemon's are a line of a few
@@ -92,7 +138,7 @@ pub fn ask(socket: &Path, request: &Request, timeout: Duration) -> Result<Respon
     stream.write_all(line.as_bytes())?;
     let mut answer = String::new();
     BufReader::new(stream.take(MOST)).read_line(&mut answer)?;
-    Ok(serde_json::from_str(&answer)?)
+    read_answer(&answer)
 }
 
 /// Ask the daemon at `socket` one thing and wait for its answer. On
@@ -115,7 +161,7 @@ pub fn ask(socket: &Path, request: &Request, timeout: Duration) -> Result<Respon
         let _ = tell.send(answer);
     });
     match told.recv_timeout(timeout) {
-        Ok(Ok(answer)) => Ok(serde_json::from_str(&answer)?),
+        Ok(Ok(answer)) => read_answer(&answer),
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => Err(IpcError::NotRunning),
         Ok(Err(e)) => Err(IpcError::Io(e)),
         Err(_) => Err(IpcError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "no answer in time"))),
@@ -159,6 +205,33 @@ mod tests {
         assert_eq!(serde_json::to_string(&saved).unwrap(), r#"{"response":"saved","path":"/c/a.mp4"}"#);
         let status = Response::Status(Status { state: "capturing".into(), buffer_secs: 60, ..Default::default() });
         assert_eq!(serde_json::from_str::<Response>(&serde_json::to_string(&status).unwrap()).unwrap(), status);
+    }
+
+    #[test]
+    fn another_version_is_read_as_far_as_it_is_known() {
+        // An older daemon: no version, no way of recording.
+        let old = r#"{"response":"status","state":"idle","detail":null,"game":null,"forced":null,"buffer_secs":60,"clips_saved":3}"#;
+        let Response::Status(status) = read_answer(old).unwrap() else { panic!("not a status") };
+        assert_eq!((status.clips_saved, status.version.as_str()), (3, ""));
+        assert!(status.other_version("0.12.0") && !Status { version: "0.12.0".into(), ..Default::default() }.other_version("0.12.0"));
+        // A newer one: fields this version has not heard of, and one it has gone without.
+        let new = r#"{"response":"status","state":"capturing","version":"9.0.0","uptime":12,"clips_saved":1}"#;
+        let Response::Status(status) = read_answer(new).unwrap() else { panic!("not a status") };
+        assert_eq!((status.state.as_str(), status.version.as_str(), status.buffer_secs), ("capturing", "9.0.0", 0));
+        assert_eq!(serde_json::from_str::<Request>(r#"{"request":"save","quietly":true}"#).unwrap(), Request::Save);
+        assert_eq!(serde_json::from_str::<Request>(r#"{"request":"capture"}"#).unwrap(), Request::Capture { force: None });
+    }
+
+    #[test]
+    fn a_message_of_an_unknown_kind_is_told_apart_from_nonsense() {
+        let err = read_answer(r#"{"response":"paused","since":4}"#).unwrap_err();
+        assert!(matches!(&err, IpcError::OtherVersion(kind) if kind == "paused"), "{err}");
+        assert!(err.to_string().contains("different version"), "{err}");
+        assert!(matches!(read_answer("hello").unwrap_err(), IpcError::Protocol(_)));
+        assert!(matches!(read_answer("").unwrap_err(), IpcError::Protocol(_)));
+        assert_eq!(kind_of(r#"{"request":"pause"}"#, "request").as_deref(), Some("pause"));
+        assert_eq!(kind_of(r#"{"request":7}"#, "request"), None);
+        assert_eq!(kind_of("[1]", "request"), None);
     }
 
     #[cfg(unix)]

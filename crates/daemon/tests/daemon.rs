@@ -1,6 +1,9 @@
 #![cfg(unix)]
 //! The daemon run for real, against `tests/fake-gsr` in place of the recorder.
-//! Needs ffmpeg (for a sample clip the fake recorder "saves"); skipped without.
+//! Needs ffmpeg (for a sample clip the fake recorder "saves"). Without it
+//! every test here is skipped, which is said on the error output; with
+//! `ZENITH_REQUIRE_FFMPEG=1` in the environment they fail instead, for
+//! where a green run has to mean they ran.
 //! The last tests run it against `tests/fake-rec`, which is told what to do
 //! over its input the way the Windows recorder is.
 
@@ -99,6 +102,9 @@ fn daemon_command(dir: &Path, mode: &str) -> Command {
         .env("FAKE_REC_ENDED", dir.join("ended"))
         .env("FAKE_GSR_MODE", mode)
         .env("ZENITH_NO_TRAY", "1")
+        // Nor a save hotkey: asking for one would reach the real desktop
+        // of whoever runs the tests.
+        .env("ZENITH_NO_HOTKEY", "1")
         .stdin(Stdio::null());
     cmd
 }
@@ -117,7 +123,13 @@ fn start_with(capture: &str, mode: &str, env: &[(&str, &str)]) -> Option<Running
         .arg(dir.path().join("sample.mp4"))
         .status();
     if !made.is_ok_and(|s| s.success()) {
-        eprintln!("skipped: no ffmpeg");
+        let required = std::env::var("ZENITH_REQUIRE_FFMPEG").is_ok_and(|v| !v.is_empty() && v != "0");
+        assert!(!required, "ffmpeg is not installed (or could not make a sample clip), and ZENITH_REQUIRE_FFMPEG says it must be");
+        // Written straight to the error output, which the test runner
+        // does not keep back the way it does what a passing test prints.
+        use std::io::Write;
+        let name = std::thread::current().name().unwrap_or("a daemon test").to_string();
+        let _ = writeln!(std::io::stderr(), "NOTE: {name} was SKIPPED, not passed: ffmpeg is not installed. Set ZENITH_REQUIRE_FFMPEG=1 to fail instead.");
         return None;
     }
     std::fs::create_dir_all(dir.path().join("run")).unwrap();
@@ -192,10 +204,117 @@ fn new_settings_restart_the_recorder() {
     assert!(args.contains("-r 30") && args.contains("-f 30") && args.contains("-s 1280x720") && args.contains("-w DP-1"), "{args}");
     assert!(matches!(d.ask(Request::Save), Response::Saved { .. }));
 
-    d.write_config("buffer_secs = \"lots\"");
+    // One value that is not valid is passed over, as it is at the start:
+    // it is at its default, and the rest of the file counts.
+    d.write_config("activation = \"always\"\nbuffer_secs = \"lots\"\nfps = 30\nresolution = \"720p\"");
+    assert_eq!(d.ask(Request::Reload), Response::Ok);
+    d.wait_for("capturing with what could be read", |s| s.state == "capturing" && s.buffer_secs == 60 && d.recorder_args().contains("-r 60"));
+    let args = d.recorder_args();
+    assert!(args.contains("-f 30") && args.contains("-s 1280x720"), "{args}");
+    // And a later change is taken in, with that value still not valid.
+    d.write_config("activation = \"always\"\nbuffer_secs = \"lots\"\nfps = 60");
+    assert_eq!(d.ask(Request::Reload), Response::Ok);
+    d.wait_for("the next change", |s| s.state == "capturing" && d.recorder_args().contains("-f 60"));
+
+    // A file that cannot be read at all is refused.
+    std::fs::write(d.path("config/zenith-clips/config.toml"), "[capture\nbuffer_secs = 30\n").unwrap();
     let Response::Error { message } = d.ask(Request::Reload) else { panic!("bad settings accepted") };
     assert!(message.contains("not valid"), "{message}");
-    assert_eq!(d.status().buffer_secs, 30, "the last good settings stay");
+    assert_eq!(d.status().buffer_secs, 60, "the last good settings stay");
+}
+
+/// A stand-in recorder for one test: it answers what `fake-gsr` answers
+/// about the machine, finds its `-o` folder, and then does `body`.
+fn recorder_that(body: &str) -> (tempfile::TempDir, String) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    // Named as the other, which is what `recorders` looks for.
+    let file = dir.path().join("fake-gsr");
+    let script = format!(
+        "#!/bin/sh\n[ \"$1\" = --list-capture-options ] && {{ echo \"DP-1|2560x1440\"; exit 0; }}\n[ \"$1\" = --list-audio-devices ] && {{ echo \"default_output|Default output\"; exit 0; }}\nout=\"\"\nwhile [ $# -gt 1 ]; do [ \"$1\" = -o ] && out=\"$2\"; shift; done\n{body}\n"
+    );
+    std::fs::write(&file, script).unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = file.to_string_lossy().into_owned();
+    (dir, path)
+}
+
+/// What every stand-in does between signals.
+const IDLE: &str = "while :; do sleep 0.05 & wait $!; done";
+
+#[test]
+fn a_recorder_that_prints_its_clip_and_ends_at_once_does_not_lose_it() {
+    let save = "trap 'cp \"$FAKE_GSR_SAMPLE\" \"$out/a.mp4\" && echo \"$out/a.mp4\"; exit 0' USR1; trap 'exit 0' INT TERM";
+    let (_script, recorder) = recorder_that(&format!("{save}\n{IDLE}"));
+    let Some(d) = start_with("activation = \"always\"", "", &[("ZENITH_RECORDER", &recorder)]) else { return };
+    for clip in 1..=3 {
+        d.wait_for("capturing", |s| s.state == "capturing" && !recorders(d.dir.path()).is_empty());
+        let answer = d.ask(Request::Save);
+        let Response::Saved { path } = answer else { panic!("clip {clip} was lost: {answer:?}") };
+        assert!(path.is_file(), "{}", path.display());
+    }
+    assert_eq!(d.status().clips_saved, 3);
+}
+
+#[test]
+fn a_clip_being_written_is_finished_before_quitting() {
+    let save = "trap 'sleep 1; cp \"$FAKE_GSR_SAMPLE\" \"$out/a.mp4\" && echo \"$out/a.mp4\"' USR1; trap 'exit 0' INT TERM";
+    let (_script, recorder) = recorder_that(&format!("{save}\n{IDLE}"));
+    let Some(mut d) = start_with("activation = \"always\"", "", &[("ZENITH_RECORDER", &recorder)]) else { return };
+    d.wait_for("capturing", |s| s.state == "capturing" && !recorders(d.dir.path()).is_empty());
+    let socket = d.path("run/zenith-clips.sock");
+    let saving = std::thread::spawn(move || ask(&socket, &Request::Save, Duration::from_secs(30)));
+    d.wait_for("saving", |s| s.state == "saving");
+    assert_eq!(d.ask(Request::Quit), Response::Ok);
+    let answer = saving.join().unwrap().unwrap();
+    let Response::Saved { path } = answer else { panic!("the clip was thrown away: {answer:?}") };
+    assert!(path.starts_with(d.path("clips/Desktop")) && path.is_file(), "{}", path.display());
+    assert!(d.child.wait().unwrap().success());
+    assert!(recorders(d.dir.path()).is_empty());
+    assert!(!d.path("clips/.incoming").exists());
+    let library = Library::open(&d.path("data/zenith-clips/library.db")).unwrap();
+    assert_eq!(library.list(&Filter::default()).unwrap().len(), 1);
+}
+
+#[test]
+fn a_clip_that_cannot_be_read_is_still_saved() {
+    let save = "trap 'echo not a video > \"$out/a.mp4\"; echo \"$out/a.mp4\"' USR1; trap 'exit 0' INT TERM";
+    let (_script, recorder) = recorder_that(&format!("{save}\n{IDLE}"));
+    let Some(d) = start_with("activation = \"always\"", "", &[("ZENITH_RECORDER", &recorder)]) else { return };
+    d.wait_for("capturing", |s| s.state == "capturing" && !recorders(d.dir.path()).is_empty());
+    let answer = d.ask(Request::Save);
+    let Response::Saved { path } = answer else { panic!("the file is there, and it said {answer:?}") };
+    assert!(path.starts_with(d.path("clips/Desktop")));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "not a video\n");
+    assert_eq!(d.status().clips_saved, 1);
+    // Not in the index, which has nothing to say about it: the app takes
+    // it in when it looks through the folder and can read it.
+    let library = Library::open(&d.path("data/zenith-clips/library.db")).unwrap();
+    assert!(library.list(&Filter::default()).unwrap().is_empty());
+}
+
+#[test]
+fn a_recorder_that_outlived_its_daemon_is_stopped_by_the_next() {
+    // One the system's "end with your parent" does not reach, as it does
+    // not reach a gpu-screen-recorder that was given capabilities.
+    let (_script, recorder) = recorder_that(&format!("trap '' TERM; trap 'exit 0' INT\n{IDLE}"));
+    let Some(mut d) = start_with("activation = \"always\"", "", &[("ZENITH_RECORDER", &recorder)]) else { return };
+    d.wait_for("a recorder", |s| s.state == "capturing" && !recorders(d.dir.path()).is_empty());
+    let before = recorders(d.dir.path());
+    d.child.kill().unwrap();
+    d.child.wait().unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(recorders(d.dir.path()), before, "this one lives on");
+
+    d.child = daemon_command(d.dir.path(), "").env("ZENITH_RECORDER", &recorder).stderr(Stdio::null()).spawn().unwrap();
+    let until = Instant::now() + Duration::from_secs(10);
+    while ask(&d.path("run/zenith-clips.sock"), &Request::Status, Duration::from_secs(1)).is_err() {
+        assert!(Instant::now() < until, "the next daemon never answered");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    d.wait_for("its own recorder", |s| s.state == "capturing" && recorders(d.dir.path()).iter().any(|pid| !before.contains(pid)));
+    let now = recorders(d.dir.path());
+    assert!(now.len() == 1 && !before.contains(&now[0]), "the one left behind is gone: {before:?} then {now:?}");
 }
 
 #[test]
@@ -288,6 +407,20 @@ fn start_on_stdin(mode: &str) -> Option<Running> {
     let env = [("ZENITH_RECORDER", &*fake.to_string_lossy()), ("ZENITH_RECORDER_CONTROL", "stdin"), ("ZENITH_SAVE_TIMEOUT", "0.5")];
     let running = start_with("activation = \"always\"", mode, &env)?;
     Some(running)
+}
+
+#[test]
+fn a_clip_the_recorder_could_not_write_is_said_at_once_and_the_recorder_kept() {
+    // Far longer than the test: an answer that comes is the recorder's own.
+    let fake = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fake-rec");
+    let env = [("ZENITH_RECORDER", &*fake.to_string_lossy()), ("ZENITH_RECORDER_CONTROL", "stdin"), ("ZENITH_SAVE_TIMEOUT", "600")];
+    let Some(d) = start_with("activation = \"always\"", "failing", &env) else { return };
+    d.wait_for("a recorder", |s| s.state == "capturing" && !recorders(d.dir.path()).is_empty());
+    let before = recorders(d.dir.path());
+    let Response::Error { message } = d.ask(Request::Save) else { panic!("a clip that could not be written was saved") };
+    assert!(message.contains("could not be joined"), "{message}");
+    assert_eq!(d.status().state, "capturing");
+    assert_eq!(recorders(d.dir.path()), before, "the same recorder, still recording");
 }
 
 /// Why the stand-in recorder of `d` ended, once it has.

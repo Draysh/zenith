@@ -157,6 +157,48 @@ pub struct Cache {
     dir: PathBuf,
 }
 
+/// The folders of the cache: thumbnails, filmstrips, waveforms.
+const KINDS: [&str; 3] = ["thumbs", "strips", "waves"];
+
+/// The most the cache holds after it is tidied. What is kept is named after
+/// its clip's path, size and time, so every rename, move and new export of
+/// a clip leaves a set behind that nothing asks for again; the oldest go
+/// first, and one that was still wanted is made again when it is.
+pub const CACHE_BYTES: u64 = 512 * 1024 * 1024;
+
+/// How often a running app tidies the cache, at most.
+const TIDY_EVERY: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+
+/// A half-made file this old was left by a Zenith that is not running any
+/// more: no picture takes this long to make.
+const LEFT_BEHIND: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Held by whoever is making a file's waveforms (see `Cache::waveform`).
+struct Making<'a>(&'a Path);
+
+static MAKING: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+static MADE: std::sync::Condvar = std::sync::Condvar::new();
+
+impl<'a> Making<'a> {
+    /// Wait until nobody else is making this file's waveforms, then be
+    /// the one who is.
+    fn of(file: &'a Path) -> Self {
+        let mut making = MAKING.lock().unwrap_or_else(|e| e.into_inner());
+        while making.iter().any(|other| other == file) {
+            making = MADE.wait(making).unwrap_or_else(|e| e.into_inner());
+        }
+        making.push(file.to_path_buf());
+        Self(file)
+    }
+}
+
+impl Drop for Making<'_> {
+    fn drop(&mut self) {
+        MAKING.lock().unwrap_or_else(|e| e.into_inner()).retain(|other| other != self.0);
+        MADE.notify_all();
+    }
+}
+
 impl Cache {
     pub fn new(dir: PathBuf) -> Self {
         Self { dir }
@@ -180,6 +222,7 @@ impl Cache {
         let out = self.thumbnail_path(file);
         if !out.is_file() {
             thumbnail(file, seconds / 3.0, 640, &out)?;
+            self.tidy_now_and_then();
         }
         Ok(out)
     }
@@ -188,6 +231,7 @@ impl Cache {
         let out = self.filmstrip_path(file, count);
         if !out.is_file() {
             filmstrip(file, seconds, count, 160, &out)?;
+            self.tidy_now_and_then();
         }
         Ok(out)
     }
@@ -204,10 +248,10 @@ impl Cache {
         if let Some(cached) = self.cached_waveform(file, track, buckets) {
             return Ok(cached);
         }
-        // One at a time: whoever asks for the next track of the same file
-        // meanwhile waits here, then finds it made.
-        static MAKING: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _making = MAKING.lock().unwrap_or_else(|e| e.into_inner());
+        // One at a time for each file: whoever asks for the next track of
+        // the same file meanwhile waits here, then finds it made. Another
+        // file's waveforms are not kept waiting behind this one's.
+        let _making = Making::of(file);
         if let Some(cached) = self.cached_waveform(file, track, buckets) {
             return Ok(cached);
         }
@@ -218,9 +262,74 @@ impl Cache {
         }
         let waves = waveforms(file, tracks, buckets, &self.dir.join("waves"))?;
         for (t, wave) in waves.iter().enumerate() {
-            let _ = std::fs::write(self.waveform_path(file, t as u32, buckets), serde_json::to_vec(wave).expect("numbers serialize"));
+            if let Ok(json) = serde_json::to_vec(wave) {
+                let _ = std::fs::write(self.waveform_path(file, t as u32, buckets), json);
+            }
         }
         Ok(waves.into_iter().nth(track as usize).unwrap_or_default())
+    }
+
+    /// Tidy the cache when something new was put in it, the first time in
+    /// a run of the app and then every few hours: often enough to keep it
+    /// in bounds, and never in the way of a screen that is waiting.
+    fn tidy_now_and_then(&self) {
+        static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+        {
+            let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+            if last.is_some_and(|at| at.elapsed() < TIDY_EVERY) {
+                return;
+            }
+            *last = Some(std::time::Instant::now());
+        }
+        self.tidy(CACHE_BYTES);
+    }
+
+    /// Bring the cache under `most` bytes by taking away what was made
+    /// longest ago, and take away half-made files a Zenith that fell over
+    /// left behind. Returns how many bytes were freed. Anything taken away
+    /// that is still wanted is made again when it is asked for.
+    pub fn tidy(&self, most: u64) -> u64 {
+        let now = std::time::SystemTime::now();
+        let mut freed = 0;
+        let mut kept: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();
+        for kind in KINDS {
+            let Ok(entries) = std::fs::read_dir(self.dir.join(kind)) else { continue };
+            for entry in entries.flatten() {
+                let Ok(meta) = entry.metadata() else { continue };
+                if !meta.is_file() {
+                    continue;
+                }
+                let made = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+                if entry.file_name().to_string_lossy().contains(".part.") {
+                    // Someone may be writing it at this moment.
+                    if now.duration_since(made).is_ok_and(|age| age > LEFT_BEHIND) && std::fs::remove_file(entry.path()).is_ok() {
+                        freed += meta.len();
+                    }
+                    continue;
+                }
+                kept.push((made, meta.len(), entry.path()));
+            }
+        }
+        let mut total: u64 = kept.iter().map(|(_, bytes, _)| bytes).sum();
+        if total <= most {
+            return freed;
+        }
+        // Down to a little under the most, so the next few pictures do not
+        // each call for another tidying.
+        let enough = most / 10 * 9;
+        kept.sort();
+        for (_, bytes, path) in kept {
+            if total <= enough {
+                break;
+            }
+            if std::fs::remove_file(&path).is_ok() {
+                freed += bytes;
+            }
+            // Counted as gone either way: one that cannot be removed is
+            // not a reason to remove everything after it.
+            total -= bytes;
+        }
+        freed
     }
 }
 
@@ -235,6 +344,64 @@ mod tests {
         assert_eq!(peaks(&samples, 1), [1.0]);
         assert_eq!(peaks(&[], 3), [0.0, 0.0, 0.0]);
         assert_eq!(peaks(&[1, 2], 4).len(), 4, "more buckets than samples still gives every bucket");
+    }
+
+    #[test]
+    fn a_tidied_cache_keeps_what_was_made_last() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path().join("cache"));
+        assert_eq!(cache.tidy(1000), 0, "no cache yet");
+        // Ten pictures of 100 bytes, made an hour apart, the first one longest ago.
+        let now = std::time::SystemTime::now();
+        let hours = |n: u64| now - std::time::Duration::from_secs(n * 3600);
+        let put = |name: &str, bytes: usize, made: std::time::SystemTime| {
+            let path = dir.path().join("cache").join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, vec![0u8; bytes]).unwrap();
+            std::fs::File::options().write(true).open(&path).unwrap().set_modified(made).unwrap();
+        };
+        for n in 0..10 {
+            put(&format!("{}/{n}.jpg", KINDS[n % 3]), 100, hours(20 - n as u64));
+        }
+        // Half-made files: one from a Zenith that fell over yesterday, one being written now.
+        put("thumbs/a.1-2.part.jpg", 50, hours(24));
+        put("waves/1-2-0.part.raw", 50, now);
+        let left = || {
+            let mut names: Vec<String> = KINDS
+                .iter()
+                .flat_map(|kind| std::fs::read_dir(dir.path().join("cache").join(kind)).unwrap())
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(cache.tidy(1000), 50, "within bounds: only what was left behind goes");
+        assert_eq!(left().len(), 11);
+        // Over: the oldest go, until it is a little under.
+        assert_eq!(cache.tidy(500), 600);
+        assert_eq!(left(), ["1-2-0.part.raw", "6.jpg", "7.jpg", "8.jpg", "9.jpg"]);
+        assert_eq!(cache.tidy(500), 0, "and then there is nothing more to do");
+    }
+
+    #[test]
+    fn waveforms_of_one_file_are_made_one_at_a_time_and_of_others_meanwhile() {
+        let (a, b) = (PathBuf::from("/c/a.mp4"), PathBuf::from("/c/b.mp4"));
+        let making_a = Making::of(&a);
+        // Another file is not kept waiting.
+        drop(Making::of(&b));
+        // The same file is, until the first is done.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let second = std::thread::spawn({
+            let a = a.clone();
+            move || {
+                let _making = Making::of(&a);
+                tx.send(()).unwrap();
+            }
+        });
+        assert!(rx.recv_timeout(std::time::Duration::from_millis(200)).is_err(), "it waits");
+        drop(making_a);
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok(), "and then goes on");
+        second.join().unwrap();
     }
 
     #[test]

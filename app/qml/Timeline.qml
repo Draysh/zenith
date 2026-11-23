@@ -100,9 +100,15 @@ Item {
     function load() {
         wantFilm()
         for (let i = 0; i < entry.tracks.length; i++) {
-            Media.waveform(entry.path, i, 800)
+            Media.waveform(entry.path, i, buckets)
         }
     }
+    // How finely a track's shape is asked for: by the clip's length, so a
+    // longer clip zoomed in is not a few wide steps. Zoomed in the furthest
+    // two seconds fill the view, some 330 bars: that many for every two
+    // seconds, in round hundreds (each count is a file in the cache), no
+    // fewer than a short clip always had and no more than `Media` makes.
+    readonly property int buckets: Math.max(800, Math.min(8000, Math.ceil(entry.seconds * 1.65) * 100))
     Component.onCompleted: load()
     // Zooming passes through sizes on its way: only where it rests is asked for.
     onTilesChanged: filmWait.restart()
@@ -377,6 +383,12 @@ Item {
                 Image {
                     anchors.fill: parent
                     source: Library.fileUrl(timeline.film)
+                    // The longest strip is 120 frames of 160 across: wider
+                    // than many graphics cards take a picture (16384). Read
+                    // no wider than they do, its frames are still taller
+                    // than the row they are shown in. (A shorter strip is
+                    // read as it is: this only ever makes one smaller.)
+                    sourceSize.width: 16384
                     fillMode: Image.Stretch
                     asynchronous: true
                     opacity: status === Image.Ready ? 1 : 0
@@ -480,11 +492,23 @@ Item {
                                 hoverEnabled: true
                                 cursorShape: Qt.SizeHorCursor
                                 preventStealing: true
-                                onPressed: { timeline.selected = piece.index; timeline.grabbing = true; timeline.handleGrabbed() }
+                                // How far the pointer was from the edge the
+                                // handle moves (the part's start or end) when
+                                // it took hold: the edge keeps that distance,
+                                // so it does not jump to the pointer at the
+                                // first move.
+                                property real held: 0
+                                onPressed: mouse => {
+                                    const edge = timeline.cx(handle.modelData ? piece.seg.start : piece.seg.end) - timeline.scroll
+                                    held = mapToItem(view, mouse.x, 0).x - edge
+                                    timeline.selected = piece.index
+                                    timeline.grabbing = true
+                                    timeline.handleGrabbed()
+                                }
                                 onPositionChanged: mouse => {
                                     if (pressed) {
                                         const p = mapToItem(view, mouse.x, 0)
-                                        timeline.handleMoved(piece.index, handle.modelData, timeline.timeAt(p.x))
+                                        timeline.handleMoved(piece.index, handle.modelData, timeline.timeAt(p.x - held))
                                     }
                                 }
                                 onReleased: { timeline.grabbing = false; timeline.handleReleased() }

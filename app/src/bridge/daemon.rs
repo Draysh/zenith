@@ -27,7 +27,14 @@ pub mod ffi {
 
         /// Ask the recorder what it is doing. `statusReady` brings
         /// `{running, state, detail, game, forced, bufferSecs}` as JSON;
-        /// `running` is false when the daemon is not there. The asking
+        /// `running` is false when the daemon is not there. `version` is
+        /// the daemon's own (empty from one too old to say) and
+        /// `otherVersion` is true when that is not this app's: the daemon
+        /// was left running across an update and has to be started again
+        /// before it does what this version does. `hotkey` is the save
+        /// hotkey the daemon has (on Linux, the one the desktop bound for
+        /// it) and `hotkeyMissing` is why it has none of its own, where a
+        /// key has to be bound to `zenithd save` by hand. The asking
         /// happens off the window's thread, so a recorder that is slow to
         /// answer does not hold the window up.
         #[qinvokable]
@@ -54,18 +61,39 @@ pub struct RecorderRust {
 
 const WAIT: Duration = Duration::from_millis(400);
 
+/// Say, once for each daemon found to be of another version, that it is.
+fn note_other_version(theirs: &str) {
+    static SAID: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+    if said.as_deref() != Some(theirs) {
+        let named = if theirs.is_empty() { "an older version" } else { theirs };
+        eprintln!("zenith-clips: the recorder that is running is {named}, not {}; it has to be started again to be this version", env!("CARGO_PKG_VERSION"));
+        *said = Some(theirs.to_string());
+    }
+}
+
 fn status_now() -> String {
     let value = match ipc::ask(&paths::socket(), &Request::Status, Duration::from_secs(2)) {
-        Ok(Response::Status(s)) => json!({
-            "running": true,
-            "state": s.state,
-            "detail": s.detail,
-            "game": s.game,
-            "forced": s.forced,
-            "bufferSecs": s.buffer_secs,
-            "recording": s.recording,
-            "fallback": s.recording.as_deref().is_some_and(zenith_core::recorder::is_fallback),
-        }),
+        Ok(Response::Status(s)) => {
+            let other_version = s.other_version(env!("CARGO_PKG_VERSION"));
+            if other_version {
+                note_other_version(&s.version);
+            }
+            json!({
+                "running": true,
+                "version": s.version,
+                "otherVersion": other_version,
+                "hotkey": s.hotkey,
+                "hotkeyMissing": s.hotkey_missing,
+                "state": s.state,
+                "detail": s.detail,
+                "game": s.game,
+                "forced": s.forced,
+                "bufferSecs": s.buffer_secs,
+                "recording": s.recording,
+                "fallback": s.recording.as_deref().is_some_and(zenith_core::recorder::is_fallback),
+            })
+        }
         _ => json!({ "running": false, "state": "stopped" }),
     };
     value.to_string()

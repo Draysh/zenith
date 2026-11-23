@@ -9,6 +9,30 @@ say it. Short and easy to take in: one line a point where that is
 enough, plain words, and only what someone using Zenith will notice. True
 to what the version does. A release is not built without one.
 
+## 0.12.0
+
+**A safer, steadier Zenith.** A top-to-bottom check of the code turned up ways to lose things; this version closes them.
+
+### Your clips and settings
+- **An unplugged drive no longer wipes names and tags.** When the clip folder is on a drive that is not there, Zenith leaves the library alone until it is back.
+- **Renaming cannot replace another clip.** A new name that only differs in capitals from another clip's gets a number instead.
+- **One bad setting no longer resets the rest.** Zenith keeps every setting it can read, and saves a copy of the old file before changing it.
+- **Closing while exporting asks first.** Nothing half-made is left behind.
+
+### Recording
+- **Linux: the clip key works without setup.** Pick it in Settings and your desktop holds it for Zenith. Where the desktop cannot, binding `zenithd save` works as before.
+- **Windows: sound stays in step.** A stutter no longer shifts the sound for the rest of the session.
+- **Windows: a game that changes resolution still gives a clip that plays.**
+- **Windows: a full disk is said plainly**, and so is a clip that could not be saved, at once instead of after a wait.
+- **A recorder that keeps stopping tells you**, once, instead of restarting quietly forever.
+- **A save in progress finishes** when you sign out or quit.
+
+### Editor and app
+- **Trim handles no longer jump** when you start dragging them.
+- **Sync changes undo in one step**, like volume.
+- **A failed update keeps Zenith open** and says why, instead of just closing.
+- **Thumbnails stop piling up.** Old ones are cleared once they pass 512 MB.
+
 ## 0.11.0
 
 **The editor has a real player bar.**

@@ -1,6 +1,8 @@
 //! The whole recorder, for real: the built `zenith-rec` with ffmpeg's test
 //! picture in place of a screen and test tones in place of sound devices.
-//! Skipped, with a note, where there is no ffmpeg.
+//! Skipped, with a note, where there is no ffmpeg; unless
+//! `ZENITH_REQUIRE_FFMPEG=1` says the tests are run to prove something,
+//! where a skip would pass for a proof: then they fail.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -16,6 +18,7 @@ fn have(program: &str) -> bool {
 fn ffmpeg_missing(test: &str) -> bool {
     let missing = !have("ffmpeg") || !have("ffprobe");
     if missing {
+        assert!(std::env::var("ZENITH_REQUIRE_FFMPEG").as_deref() != Ok("1"), "{test}: ffmpeg and ffprobe are not installed, and ZENITH_REQUIRE_FFMPEG=1 says they have to be");
         println!("NOTE: {test} skipped: ffmpeg and ffprobe are not installed");
     }
     missing
@@ -36,7 +39,11 @@ impl Recorder {
     }
 
     fn start_with(codec: &str, buffer_secs: u32, tracks: &[&str]) -> Self {
-        let dir = tempfile::tempdir().unwrap();
+        Self::start_in(tempfile::tempdir().unwrap(), codec, buffer_secs, tracks, &[])
+    }
+
+    /// Started with `dir` as it was made ready, and `env` set besides.
+    fn start_in(dir: tempfile::TempDir, codec: &str, buffer_secs: u32, tracks: &[&str], env: &[(&str, &str)]) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_zenith-rec"));
         command.args(["-w", "screen", "-c", "mp4", "-f", "30", "-s", "320x180", "-k", codec, "-bm", "cbr", "-q", "1000"]);
         command.args(["-r", &buffer_secs.to_string(), "-replay-storage", "ram", "-keyint", "1", "-ac", "aac", "-cursor", "yes"]);
@@ -45,6 +52,7 @@ impl Recorder {
         }
         command.args(["-v", "no", "-o"]).arg(dir.path().join("clips"));
         command.env("ZENITH_REC_TEST_SOURCE", "1").env("ZENITH_REC_TEST_TONE", "1").env("ZENITH_REC_LOG_DIR", dir.path().join("logs"));
+        command.envs(env.iter().copied());
         let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
         let (tx, stdout) = mpsc::channel();
         let out = child.stdout.take().unwrap();
@@ -163,6 +171,16 @@ fn video_codec(clip: &Path) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
+/// How the clip says its colours are to be read: range, matrix, transfer, primaries.
+fn colours(clip: &Path) -> String {
+    let out = Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=color_range,color_space,color_transfer,color_primaries", "-of", "csv=p=0"])
+        .arg(clip)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
 /// The kinds of the clip's streams in order, and its length in seconds.
 fn probe(clip: &Path) -> (Vec<String>, f64) {
     let out = Command::new("ffprobe")
@@ -215,6 +233,8 @@ fn a_clip_is_saved_with_its_tracks_in_order_and_stop_ends_it() {
     let (first, second) = (pitch(&clip, 0), pitch(&clip, 1));
     assert!((425.0..455.0).contains(&first), "first track at {first} Hz");
     assert!((850.0..910.0).contains(&second), "second track at {second} Hz");
+    // No player has to guess how the colours are meant.
+    assert_eq!(colours(&clip), "tv,bt709,bt709,bt709", "{}", rec.log());
 
     // A word it does not know changes nothing; a second clip gets its own name.
     rec.say("hello");
@@ -227,6 +247,62 @@ fn a_clip_is_saved_with_its_tracks_in_order_and_stop_ends_it() {
     assert_eq!(rec.finish(), Some(0), "{}", rec.log());
     rec.assert_clean();
     assert!(rec.dir.path().join("logs/zenith-rec.log").is_file(), "the log is written to a file as well");
+}
+
+#[test]
+fn a_save_that_fails_is_answered_on_stdout_and_the_recording_goes_on() {
+    if ffmpeg_missing("answering a save that fails") {
+        return;
+    }
+    // Where the clips should go there is a file: no folder can be made.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("clips"), b"in the way").unwrap();
+    let mut rec = Recorder::start_in(dir, "h264", 3, &["default_output"], &[]);
+    std::thread::sleep(Duration::from_millis(2500));
+    let answer = rec.save();
+    let answer = answer.to_string_lossy();
+    assert!(answer.starts_with("save-failed: ") && answer.contains("could not be made"), "{answer}\n{}", rec.log());
+    assert!(!Path::new(&*answer).is_absolute(), "never mistaken for a clip's path");
+    assert!(rec.log().contains("save failed: "));
+    // Not ended by it: once there is somewhere to put it, the clip is saved.
+    std::fs::remove_file(rec.dir.path().join("clips")).unwrap();
+    let clip = rec.save();
+    assert!(clip.is_file(), "{}:\n{}", clip.display(), rec.log());
+    rec.say("stop");
+    assert_eq!(rec.finish(), Some(0), "{}", rec.log());
+    rec.assert_clean();
+}
+
+#[test]
+fn a_clip_left_half_written_by_a_recorder_that_was_killed_is_cleared_away() {
+    if ffmpeg_missing("clearing half-written clips away") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let clips = dir.path().join("clips");
+    std::fs::create_dir_all(&clips).unwrap();
+    std::fs::write(clips.join("Replay_2026-11-20_18-04-09.mp4.part"), b"half").unwrap();
+    std::fs::write(clips.join("Replay_2026-11-20_18-04-09.mp4"), b"whole").unwrap();
+    let mut rec = Recorder::start_in(dir, "h264", 3, &[], &[]);
+    rec.wait_for("ffmpeg to start", |r| !r.ffmpeg_pids().is_empty());
+    assert!(!clips.join("Replay_2026-11-20_18-04-09.mp4.part").exists(), "{}", rec.log());
+    assert!(clips.join("Replay_2026-11-20_18-04-09.mp4").exists(), "a finished clip is never touched");
+    rec.say("stop");
+    assert_eq!(rec.finish(), Some(0), "{}", rec.log());
+    rec.assert_clean();
+}
+
+#[test]
+fn a_disk_with_no_room_for_the_buffer_ends_it_with_a_reason_and_code_of_its_own() {
+    // A megabyte free, the test says: no ffmpeg is needed to see that a
+    // buffer does not fit.
+    let mut rec = Recorder::start_in(tempfile::tempdir().unwrap(), "h264", 30, &["default_output"], &[("ZENITH_REC_TEST_FREE_BYTES", "1000000")]);
+    assert_eq!(rec.finish(), Some(3), "{}", rec.log());
+    let log = rec.log();
+    let last = log.lines().last().unwrap_or_default();
+    assert!(last.contains("giving up: no room on the disk for the replay buffer") && last.contains("1 MB are free"), "the last line is the one the daemon shows: {last}");
+    assert!(rec.ffmpeg_pids().is_empty(), "nothing was started");
+    rec.assert_clean();
 }
 
 #[test]

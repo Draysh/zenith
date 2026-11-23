@@ -4,9 +4,11 @@
 //! A release for Linux is a `.tar.gz` of the programs. Each is written
 //! beside the one it replaces, the new app is started once to see that it
 //! runs here, and only then are the files switched, with the old ones kept.
-//! The first start of the new version is a trial: if the app is started a
-//! second time without the first having run well, the old files come back
-//! and that version is not installed by itself again.
+//! The first start of the new version is a trial: if the app is started
+//! again after that start has ended without having run well, the old files
+//! come back and that version is not installed by itself again. A start
+//! that is still running has not failed: opening the app a second time in
+//! its first seconds is not a reason to go back.
 
 use serde::{Deserialize, Serialize};
 use std::io::Read;
@@ -99,6 +101,9 @@ struct Trial {
     to: String,
     /// How many times the new version has been started.
     starts: u32,
+    /// The processes those starts were, to see whether one still runs.
+    #[serde(default)]
+    pids: Vec<u32>,
     /// The programs that were switched.
     programs: Vec<String>,
 }
@@ -132,10 +137,32 @@ pub fn put_in_place(
         clean(dir);
         return Err(std::io::Error::other(format!("the new version does not start here (it said: {})", said.trim())));
     }
-    for (name, _) in programs {
+    let names: Vec<&str> = programs.iter().map(|(name, _)| name.as_str()).collect();
+    let switched = switch(dir, &names).and_then(|()| {
+        let trial = Trial { from: from.into(), to: to.into(), starts: 0, pids: Vec::new(), programs: names.iter().map(|n| n.to_string()).collect() };
+        std::fs::write(dir.join(TRIAL), serde_json::to_vec(&trial).map_err(std::io::Error::other)?)
+    });
+    if let Err(e) = switched {
+        // The app and the recorder are one version or the other, never one
+        // of each: whatever was switched is switched back.
+        put_back(dir, &names);
+        clean(dir);
+        let _ = std::fs::remove_file(dir.join(TRIAL));
+        return Err(e);
+    }
+    let _ = std::fs::remove_file(dir.join(ROLLED_BACK));
+    Ok(())
+}
+
+/// Put each staged program in the place of the one there, which is kept.
+/// It stops at the first that cannot be switched; `put_back` undoes it.
+fn switch(dir: &Path, names: &[&str]) -> std::io::Result<()> {
+    for name in names {
+        let _ = std::fs::remove_file(kept(dir, name));
+    }
+    for name in names {
         let now = dir.join(name);
         let old = kept(dir, name);
-        let _ = std::fs::remove_file(&old);
         if now.exists() {
             // A second name for the old file, so it is still there after
             // the new one takes its place.
@@ -143,10 +170,19 @@ pub fn put_in_place(
         }
         std::fs::rename(staged(dir, name), &now)?;
     }
-    let trial = Trial { from: from.into(), to: to.into(), starts: 0, programs: programs.iter().map(|(n, _)| n.clone()).collect() };
-    std::fs::write(dir.join(TRIAL), serde_json::to_vec(&trial).expect("a trial serializes"))?;
-    let _ = std::fs::remove_file(dir.join(ROLLED_BACK));
     Ok(())
+}
+
+/// The kept programs back in their places.
+fn put_back(dir: &Path, names: &[&str]) {
+    for name in names {
+        let old = kept(dir, name);
+        if old.exists() && std::fs::rename(&old, dir.join(name)).is_ok() {
+            // One that was kept but not switched yet is the same file under
+            // both names, and a rename of a file onto itself leaves both.
+            let _ = std::fs::remove_file(&old);
+        }
+    }
 }
 
 /// What the start of the app found.
@@ -163,6 +199,26 @@ pub enum Start {
 
 /// Called as the app starts, running version `current` from `dir`.
 pub fn on_start(dir: &Path, current: &str) -> Start {
+    on_start_as(dir, current, std::process::id(), still_runs)
+}
+
+/// Whether the app's process `pid` is still there. Only Linux switches the
+/// programs in place and has a trial at all.
+fn still_runs(pid: u32) -> bool {
+    // A number that has since gone to some other program is not the app.
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok();
+    exe.as_deref().and_then(Path::file_name).is_some_and(|name| name.to_string_lossy().starts_with(APP))
+}
+
+/// `on_start` for the process `me`, with `runs` to say whether an earlier
+/// start's process is still there.
+///
+/// The new version goes back only when it was started before, none of
+/// those starts is still running, and none of them said it ran well
+/// (`started_well` ends the trial). A start that is still running is in
+/// its first seconds, or stuck: neither is known to have failed, so this
+/// start joins the trial instead.
+fn on_start_as(dir: &Path, current: &str, me: u32, runs: impl Fn(u32) -> bool) -> Start {
     let path = dir.join(TRIAL);
     let Some(mut trial) = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice::<Trial>(&b).ok()) else {
         return Start::Usual;
@@ -172,9 +228,15 @@ pub fn on_start(dir: &Path, current: &str) -> Start {
         let _ = std::fs::remove_file(&path);
         return Start::Usual;
     }
-    trial.starts += 1;
-    if trial.starts == 1 {
-        let _ = std::fs::write(&path, serde_json::to_vec(&trial).expect("a trial serializes"));
+    // (A number of this very process is one from before a restart of the
+    // computer, given out again.)
+    if trial.starts == 0 || trial.pids.iter().any(|pid| *pid != me && runs(*pid)) {
+        trial.starts += 1;
+        trial.pids.retain(|pid| *pid != me);
+        trial.pids.push(me);
+        if let Ok(bytes) = serde_json::to_vec(&trial) {
+            let _ = std::fs::write(&path, bytes);
+        }
         return Start::Trying;
     }
     go_back(dir, &trial);
@@ -182,12 +244,8 @@ pub fn on_start(dir: &Path, current: &str) -> Start {
 }
 
 fn go_back(dir: &Path, trial: &Trial) {
-    for name in &trial.programs {
-        let old = kept(dir, name);
-        if old.exists() {
-            let _ = std::fs::rename(&old, dir.join(name));
-        }
-    }
+    let names: Vec<&str> = trial.programs.iter().map(String::as_str).collect();
+    put_back(dir, &names);
     let _ = std::fs::remove_file(dir.join(TRIAL));
     let _ = std::fs::write(dir.join(ROLLED_BACK), &trial.to);
 }
@@ -301,11 +359,84 @@ mod tests {
         assert_eq!(on_start(d, "0.2.0"), Start::Trying);
         // It fell over before it ran well, and is started again.
         assert_eq!(on_start(d, "0.2.0"), Start::WentBack { to: "0.1.0".into() });
+        assert!(!d.join(".zenith-clips.old").exists() && !d.join(TRIAL).exists());
         assert_eq!((read(d, APP), read(d, DAEMON)), ("old app".into(), "old daemon".into()));
         assert_eq!(rolled_back(d), Some("0.2.0".into()));
         assert_eq!(on_start(d, "0.1.0"), Start::Usual);
         // Installing a later version forgets the one that failed.
         put_in_place(d, &new, "0.1.0", "0.2.1", |_| Ok("zenith-clips 0.2.1".into())).unwrap();
         assert_eq!(rolled_back(d), None);
+    }
+
+    // Switching the programs in place is how Linux updates; Windows runs a setup program.
+    #[cfg(unix)]
+    #[test]
+    fn a_second_start_while_the_first_still_runs_is_no_reason_to_go_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        std::fs::write(d.join(APP), "old app").unwrap();
+        let new = [(APP.to_string(), b"new app".to_vec())];
+        put_in_place(d, &new, "0.1.0", "0.2.0", |_| Ok("zenith-clips 0.2.0".into())).unwrap();
+        let running = std::cell::RefCell::new(vec![100]);
+        let runs = |pid: u32| running.borrow().contains(&pid);
+        assert_eq!(on_start_as(d, "0.2.0", 100, runs), Start::Trying);
+        // Opened twice more in its first seconds, the first still there.
+        running.borrow_mut().push(200);
+        assert_eq!(on_start_as(d, "0.2.0", 200, runs), Start::Trying);
+        assert_eq!(on_start_as(d, "0.2.0", 300, runs), Start::Trying);
+        assert_eq!(read(d, APP), "new app");
+        // The first one closed; the second is still on trial for all of them.
+        running.borrow_mut().retain(|pid| *pid != 100);
+        assert_eq!(on_start_as(d, "0.2.0", 400, runs), Start::Trying);
+        // All of them ended, and none had run well.
+        running.borrow_mut().clear();
+        assert_eq!(on_start_as(d, "0.2.0", 500, runs), Start::WentBack { to: "0.1.0".into() });
+        assert_eq!(read(d, APP), "old app");
+
+        // One that ran well ends the trial for every start after it.
+        put_in_place(d, &new, "0.1.0", "0.2.1", |_| Ok("zenith-clips 0.2.1".into())).unwrap();
+        assert_eq!(on_start_as(d, "0.2.1", 100, |_| false), Start::Trying);
+        started_well(d);
+        assert_eq!(on_start_as(d, "0.2.1", 200, |_| false), Start::Usual);
+        assert_eq!(read(d, APP), "new app");
+
+        // A number given out again after a restart is not a start still running.
+        put_in_place(d, &new, "0.2.1", "0.2.2", |_| Ok("zenith-clips 0.2.2".into())).unwrap();
+        assert_eq!(on_start_as(d, "0.2.2", 100, |_| true), Start::Trying);
+        assert_eq!(on_start_as(d, "0.2.2", 100, |pid| pid != 100), Start::WentBack { to: "0.2.1".into() });
+    }
+
+    // Switching the programs in place is how Linux updates; Windows runs a setup program.
+    #[cfg(unix)]
+    #[test]
+    fn a_trial_begun_by_the_version_before_this_one_still_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        std::fs::write(d.join(APP), "new app").unwrap();
+        std::fs::write(d.join(".zenith-clips.old"), "old app").unwrap();
+        std::fs::write(d.join(TRIAL), r#"{"from":"0.1.0","to":"0.2.0","starts":0,"programs":["zenith-clips"]}"#).unwrap();
+        assert_eq!(on_start_as(d, "0.2.0", 100, |_| false), Start::Trying);
+        assert_eq!(on_start_as(d, "0.2.0", 200, |_| false), Start::WentBack { to: "0.1.0".into() });
+        assert_eq!(read(d, APP), "old app");
+    }
+
+    // Switching the programs in place is how Linux updates; Windows runs a setup program.
+    #[cfg(unix)]
+    #[test]
+    fn a_switch_that_fails_halfway_leaves_both_programs_as_they_were() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        std::fs::write(d.join(APP), "old app").unwrap();
+        // The recorder's name is taken by something a file cannot replace.
+        std::fs::create_dir(d.join(DAEMON)).unwrap();
+        std::fs::write(d.join(DAEMON).join("in the way"), "").unwrap();
+        let new = [(APP.to_string(), b"new app".to_vec()), (DAEMON.to_string(), b"new daemon".to_vec())];
+        assert!(put_in_place(d, &new, "0.1.0", "0.2.0", |_| Ok("zenith-clips 0.2.0".into())).is_err());
+        assert_eq!(read(d, APP), "old app", "the app is not left a version ahead of the recorder");
+        let mut left: Vec<_> = std::fs::read_dir(d).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        assert_eq!(left, [APP, DAEMON], "nothing is left lying about");
+        assert_eq!(on_start(d, "0.1.0"), Start::Usual);
+        assert_eq!(on_start(d, "0.2.0"), Start::Usual, "and nothing is on trial");
     }
 }

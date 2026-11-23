@@ -312,7 +312,13 @@ fn attempts(
         }
         let count = cmds.len() as f64;
         for (i, cmd) in cmds.iter().enumerate() {
-            run_one(cmd, cancel, |t| progress(((i as f64 + (t / total).min(1.0)) / count).min(0.999)))?;
+            match run_one(cmd, cancel, |t| progress(((i as f64 + (t / total).min(1.0)) / count).min(0.999))) {
+                // The same command ran a moment ago, at a higher rate: what
+                // the encoder refuses now is a rate too low for it to make
+                // a picture with at all. The limit cannot be met.
+                Err(ExportError::Failed(_)) if round > 0 => return Err(ExportError::TooBig { actual: last, limit: limit.unwrap_or(0) }),
+                done => done?,
+            }
         }
         last = std::fs::metadata(partial)?.len();
         match (limit, attempt.picture) {
@@ -323,11 +329,26 @@ fn attempts(
     Err(ExportError::TooBig { actual: last, limit: limit.unwrap_or(0) })
 }
 
-/// Render a job. `progress` is told how far along it is, 0 to 1. With a size
-/// limit the result is checked and made again smaller until it is under;
-/// what is left at `job.output` is always a finished file under the limit,
-/// or nothing.
-pub fn run(job: &Job, limit: Option<u64>, cancel: &AtomicBool, mut progress: impl FnMut(f64)) -> Result<u64, ExportError> {
+/// What is passed on of the progress that is reported: only what is further
+/// along than anything said before.
+fn forward_only(mut progress: impl FnMut(f64)) -> impl FnMut(f64) {
+    let mut furthest = 0.0;
+    move |now: f64| {
+        if now > furthest {
+            furthest = now;
+            progress(now);
+        }
+    }
+}
+
+/// Render a job. `progress` is told how far along it is, 0 to 1, and never
+/// that it is less far than it was: another try for the size starts at the
+/// beginning again, and through it the progress stays where it had got to.
+/// With a size limit the result is checked and made again smaller until it
+/// is under; what is left at `job.output` is always a finished file under
+/// the limit, or nothing.
+pub fn run(job: &Job, limit: Option<u64>, cancel: &AtomicBool, progress: impl FnMut(f64)) -> Result<u64, ExportError> {
+    let mut progress = forward_only(progress);
     if let Some(dir) = job.output.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -458,6 +479,19 @@ mod tests {
         assert_eq!(cmds.len(), 1);
         let cmd = cmds[0].join(" ");
         assert!(cmd.contains("-crf 16") && cmd.contains(" -an ") && !cmd.contains("-pass"), "{cmd}");
+    }
+
+    #[test]
+    fn progress_is_never_said_to_go_back() {
+        let mut seen = Vec::new();
+        {
+            let mut progress = forward_only(|f| seen.push(f));
+            // Two passes, then the second again for the size, then done.
+            for f in [0.0, 0.2, 0.499, 0.5, 0.8, 0.999, 0.0, 0.3, 0.999, 1.0] {
+                progress(f);
+            }
+        }
+        assert_eq!(seen, [0.2, 0.499, 0.5, 0.8, 0.999, 1.0]);
     }
 
     #[test]

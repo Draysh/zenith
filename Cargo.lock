@@ -2431,7 +2431,7 @@ dependencies = [
 
 [[package]]
 name = "zenith"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "cxx",
  "cxx-qt",
@@ -2446,7 +2446,7 @@ dependencies = [
 
 [[package]]
 name = "zenith-core"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "chrono",
  "flate2",
@@ -2466,9 +2466,10 @@ dependencies = [
 
 [[package]]
 name = "zenith-daemon"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "chrono",
+ "futures-util",
  "global-hotkey",
  "ksni",
  "libc",
@@ -2479,12 +2480,13 @@ dependencies = [
  "tokio",
  "tray-icon",
  "windows-sys 0.61.2",
+ "zbus 5.19.0",
  "zenith-core",
 ]
 
 [[package]]
 name = "zenith-rec"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "chrono",
  "sysinfo",
@@ -2496,7 +2498,7 @@ dependencies = [
 
 [[package]]
 name = "zenith-sign"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "minisign",
  "serde_json",

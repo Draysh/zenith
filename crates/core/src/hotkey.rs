@@ -1,7 +1,9 @@
 //! The save hotkey as the settings spell it: `Alt+F9`, `Ctrl+Shift+S`.
-//! Only Windows uses it, where the daemon holds the key combination itself;
-//! on Linux the desktop's own shortcut settings run `zenithd save`. Reading
-//! the text is plain logic, so it lives here and is tested everywhere.
+//! On Windows the daemon holds the key combination itself. On Linux it
+//! asks the desktop for it (the GlobalShortcuts portal), and where the
+//! desktop has none to give, its own shortcut settings run `zenithd save`.
+//! Reading the text is plain logic, so it lives here and is tested
+//! everywhere.
 
 use std::fmt;
 

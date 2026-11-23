@@ -17,6 +17,11 @@ pub fn save_timeout(megabytes: u32) -> Duration {
 pub const HEALTHY_AFTER: Duration = Duration::from_secs(10);
 /// After this many failed starts in a row it stops trying.
 pub const MAX_ATTEMPTS: u32 = 5;
+/// A recorder that lives this long is counted as steady: one that ends
+/// sooner, again and again, starts properly and still does not stay up.
+pub const STEADY_AFTER: Duration = Duration::from_secs(300);
+/// After this many runs in a row that were not steady, the user is told.
+pub const UNSTEADY_AT: u32 = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum State {
@@ -44,6 +49,9 @@ pub enum Event {
     SaveRequested,
     /// The recorder reported a finished clip.
     Saved(PathBuf),
+    /// The recorder said it could not write the clip, and why. It is
+    /// still recording.
+    SaveFailed(String),
     SaveTimedOut,
     /// The recorder process ended; `ran` is how long it lived.
     Exited { ran: Duration, detail: String },
@@ -72,6 +80,10 @@ pub enum Problem {
     NotCapturing,
     SaveFailed(String),
     RecorderFailed(String),
+    /// The recorder starts, runs a while and stops, over and over. It is
+    /// still restarted each time; this is said once, with why it stopped
+    /// last.
+    RecorderUnsteady(String),
 }
 
 #[derive(Debug)]
@@ -80,6 +92,11 @@ pub struct Supervisor {
     wanted: bool,
     /// Starts in a row that ended before `HEALTHY_AFTER`.
     short_runs: u32,
+    /// Runs in a row that ended by themselves before `STEADY_AFTER`: the
+    /// short ones, and the ones too long to count as a failed start.
+    unsteady_runs: u32,
+    /// That it keeps stopping has been said, for this row of runs.
+    unsteady_told: bool,
     /// New settings came while a clip was being written: the recorder is
     /// started afresh once the clip is out.
     restart_pending: bool,
@@ -87,12 +104,16 @@ pub struct Supervisor {
 
 impl Default for Supervisor {
     fn default() -> Self {
-        Self { state: State::Idle, wanted: false, short_runs: 0, restart_pending: false }
+        Self { state: State::Idle, wanted: false, short_runs: 0, unsteady_runs: 0, unsteady_told: false, restart_pending: false }
     }
 }
 
-fn backoff(attempt: u32) -> Duration {
-    Duration::from_millis(500 * 2u64.pow(attempt.min(5)))
+/// The wait before the start after `runs` in a row that did not last: a
+/// second at first, doubled each time, up to about a minute. The failed
+/// starts are given up on long before that; the wait keeps growing for a
+/// recorder that runs a while each time, which is never given up on.
+fn backoff(runs: u32) -> Duration {
+    Duration::from_millis(500 * 2u64.pow(runs.min(7)))
 }
 
 impl Supervisor {
@@ -108,6 +129,13 @@ impl Supervisor {
         matches!(self.state, State::Capturing | State::Saving)
     }
 
+    /// Start counting afresh: it was asked for anew.
+    fn forgive(&mut self) {
+        self.short_runs = 0;
+        self.unsteady_runs = 0;
+        self.unsteady_told = false;
+    }
+
     pub fn handle(&mut self, event: Event) -> Vec<Action> {
         use Action::*;
         use State::*;
@@ -117,7 +145,7 @@ impl Supervisor {
                 match self.state {
                     // A new request clears an earlier failure.
                     Idle | Failed { .. } => {
-                        self.short_runs = 0;
+                        self.forgive();
                         self.state = Capturing;
                         vec![Spawn]
                     }
@@ -138,7 +166,7 @@ impl Supervisor {
             Event::Reconfigure | Event::Refresh => match self.state {
                 Capturing => vec![Kill, Spawn],
                 Failed { .. } if self.wanted => {
-                    self.short_runs = 0;
+                    self.forgive();
                     self.state = Capturing;
                     vec![Spawn]
                 }
@@ -175,6 +203,25 @@ impl Supervisor {
                     vec![ClipSaved(path)]
                 }
             }
+            Event::SaveFailed(why) => {
+                if self.state != Saving {
+                    return vec![];
+                }
+                // It answered, so it is well: it is kept, unless it was
+                // only still running for this clip's sake.
+                let report = Report(Problem::SaveFailed(why));
+                let restart = std::mem::take(&mut self.restart_pending);
+                if !self.wanted {
+                    self.state = Idle;
+                    vec![report, Kill]
+                } else if restart {
+                    self.state = Capturing;
+                    vec![report, Kill, Spawn]
+                } else {
+                    self.state = Capturing;
+                    vec![report]
+                }
+            }
             Event::SaveTimedOut => {
                 if self.state != Saving {
                     return vec![];
@@ -204,13 +251,24 @@ impl Supervisor {
                     return out;
                 }
                 self.short_runs = if ran >= HEALTHY_AFTER { 1 } else { self.short_runs + 1 };
+                if ran >= STEADY_AFTER {
+                    self.unsteady_told = false;
+                }
+                self.unsteady_runs = if ran >= STEADY_AFTER { 1 } else { self.unsteady_runs + 1 };
                 let attempt = self.short_runs;
                 if attempt > MAX_ATTEMPTS {
                     self.state = Failed { reason: detail.clone() };
                     out.push(Report(Problem::RecorderFailed(detail)));
                 } else {
+                    // Said after a run that got going, not after a failed
+                    // start: a row of those ends in giving up, which is
+                    // said then.
+                    if ran >= HEALTHY_AFTER && self.unsteady_runs >= UNSTEADY_AT && !self.unsteady_told {
+                        self.unsteady_told = true;
+                        out.push(Report(Problem::RecorderUnsteady(detail)));
+                    }
                     self.state = Restarting { attempt };
-                    out.push(RetryIn(backoff(attempt)));
+                    out.push(RetryIn(backoff(self.unsteady_runs)));
                 }
                 out
             }
@@ -240,6 +298,23 @@ mod tests {
 
     fn exited(secs: u64) -> Event {
         Event::Exited { ran: Duration::from_secs(secs), detail: "exit status 1".into() }
+    }
+
+    #[test]
+    fn a_clip_the_recorder_could_not_write_is_said_and_the_recorder_kept() {
+        let mut s = capturing();
+        assert_eq!(s.handle(Event::SaveFailed("late".into())), [], "nothing was being saved");
+        assert_eq!(s.handle(Event::SaveRequested), [SignalSave]);
+        let why = "the pieces could not be joined";
+        assert_eq!(s.handle(Event::SaveFailed(why.into())), [Report(Problem::SaveFailed(why.into()))]);
+        assert_eq!(*s.state(), State::Capturing);
+        // The timer of that save says nothing more.
+        assert_eq!(s.handle(Event::SaveTimedOut), []);
+        // Not wanted any more, it was only running for the clip.
+        assert_eq!(s.handle(Event::SaveRequested), [SignalSave]);
+        s.handle(Event::Want(false));
+        assert_eq!(s.handle(Event::SaveFailed(why.into())), [Report(Problem::SaveFailed(why.into())), Kill]);
+        assert_eq!(*s.state(), State::Idle);
     }
 
     fn capturing() -> Supervisor {
@@ -323,6 +398,43 @@ mod tests {
             s.handle(Event::RetryDue);
         }
         assert_eq!(s.handle(exited(600)), [RetryIn(backoff(1))]);
+    }
+
+    #[test]
+    fn one_that_keeps_stopping_after_a_while_waits_longer_each_time_and_is_said_once() {
+        let mut s = capturing();
+        let mut waits = vec![];
+        let mut said = 0;
+        for run in 1..=12 {
+            let out = s.handle(exited(15));
+            said += out.iter().filter(|a| matches!(a, Report(Problem::RecorderUnsteady(_)))).count();
+            assert_eq!(said, usize::from(run >= UNSTEADY_AT), "run {run}: {out:?}");
+            match out.last() {
+                Some(RetryIn(d)) => waits.push(*d),
+                other => panic!("run {run}: {other:?}"),
+            }
+            // Each of them started properly: it is never given up on.
+            assert_eq!(*s.state(), State::Restarting { attempt: 1 });
+            assert_eq!(s.handle(Event::RetryDue), [Spawn]);
+        }
+        assert!(waits.windows(2).all(|w| w[1] >= w[0]) && waits[6] > waits[0], "{waits:?}");
+        assert_eq!(waits[11], Duration::from_secs(64), "the wait stops growing at about a minute");
+        // A steady run, and the count starts again: so does the telling.
+        assert_eq!(s.handle(exited(3600)), [RetryIn(backoff(1))]);
+        s.handle(Event::RetryDue);
+        assert_eq!(s.handle(exited(15)), [RetryIn(backoff(2))]);
+        s.handle(Event::RetryDue);
+        assert_eq!(s.handle(exited(15)), [Report(Problem::RecorderUnsteady("exit status 1".into())), RetryIn(backoff(3))]);
+    }
+
+    #[test]
+    fn failed_starts_are_not_also_called_unsteady() {
+        let mut s = capturing();
+        for _ in 1..=MAX_ATTEMPTS {
+            assert!(matches!(s.handle(exited(0)).as_slice(), [RetryIn(_)]));
+            s.handle(Event::RetryDue);
+        }
+        assert_eq!(s.handle(exited(0)), [Report(Problem::RecorderFailed("exit status 1".into()))]);
     }
 
     #[test]

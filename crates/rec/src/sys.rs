@@ -1,8 +1,9 @@
 //! Where this program keeps its files, and the one thing it asks of the
 //! operating system about its child: that it never outlives us.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Child;
+use std::sync::OnceLock;
 
 /// Zenith's own folder for things that are not the user's clips:
 /// `%LOCALAPPDATA%\Zenith` on Windows. Elsewhere this program only runs in
@@ -73,8 +74,17 @@ pub fn prefer_this_thread() {
 /// Windows closes the job with us and takes ffmpeg along. Without it an
 /// orphaned ffmpeg would go on capturing the screen into the ring forever.
 pub struct ChildLeash {
+    /// The job's handle, as the number it is: good on any thread, for the
+    /// life of the process.
     #[cfg(windows)]
-    job: Option<windows::Win32::Foundation::HANDLE>,
+    job: Option<isize>,
+}
+
+/// The one leash of this process: every ffmpeg it starts is held by it,
+/// the recording as much as a try of a second or the joining of a clip.
+pub fn leash() -> &'static ChildLeash {
+    static LEASH: OnceLock<ChildLeash> = OnceLock::new();
+    LEASH.get_or_init(ChildLeash::new)
 }
 
 impl ChildLeash {
@@ -98,7 +108,7 @@ impl ChildLeash {
                 info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
                 let size = std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32;
                 match SetInformationJobObject(job, JobObjectExtendedLimitInformation, (&raw const info).cast(), size) {
-                    Ok(()) => Some(job),
+                    Ok(()) => Some(job.0 as isize),
                     Err(err) => {
                         crate::note!("the job that ties ffmpeg to this process could not be set up: {err}");
                         None
@@ -113,11 +123,39 @@ impl ChildLeash {
     pub fn hold(&self, child: &Child) {
         use std::os::windows::io::AsRawHandle;
         let Some(job) = self.job else { return };
+        let job = windows::Win32::Foundation::HANDLE(job as *mut std::ffi::c_void);
         let process = windows::Win32::Foundation::HANDLE(child.as_raw_handle());
         // SAFETY: both handles are open and owned by this process.
         if let Err(err) = unsafe { windows::Win32::System::JobObjects::AssignProcessToJobObject(job, process) } {
             crate::note!("ffmpeg could not be tied to this process ({err}); it may outlive a crash");
         }
+    }
+}
+
+/// The room left for this user on the disk `dir` is on (or will be, when
+/// it is not made yet), in bytes. `None` when it cannot be told, which is
+/// everywhere but Windows: there this program only runs in tests, which
+/// say how much there is with `ZENITH_REC_TEST_FREE_BYTES`.
+pub fn free_bytes(dir: &Path) -> Option<u64> {
+    if let Some(pretend) = std::env::var("ZENITH_REC_TEST_FREE_BYTES").ok().and_then(|v| v.trim().parse().ok()) {
+        return Some(pretend);
+    }
+    #[cfg(windows)]
+    {
+        use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+        // The nearest folder that is there: all of them are on one disk.
+        let there = dir.ancestors().find(|dir| dir.is_dir())?;
+        let name = windows::core::HSTRING::from(there.as_os_str());
+        let mut free = 0u64;
+        // SAFETY: `name` is a NUL-terminated string that outlives the
+        // call, and `free` a place for the one number asked for.
+        unsafe { GetDiskFreeSpaceExW(&name, Some(&raw mut free), None, None) }.ok()?;
+        Some(free)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = dir;
+        None
     }
 }
 

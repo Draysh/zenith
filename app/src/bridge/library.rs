@@ -14,8 +14,8 @@ use std::cell::{OnceCell, RefCell};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 #[cxx_qt::bridge]
 pub mod ffi {
@@ -158,6 +158,11 @@ pub struct LibraryRust {
     /// Each game's cover, looked up once: finding it reads Steam's files.
     covers: RefCell<HashMap<String, Option<String>>>,
     scanning: Arc<AtomicBool>,
+    /// The library as the threads that read the clip folder have it: one
+    /// connection for all of them, opened by the first. It remembers which
+    /// files could not be read as videos, so a broken one in the folder is
+    /// looked into once and not at every look at the folder.
+    scanner: Arc<Mutex<Option<lib::Library>>>,
     /// The clips of the last `trash`, while taking it back is still offered.
     undoable: RefCell<Vec<i64>>,
 }
@@ -176,8 +181,19 @@ fn rescan_now(db: &lib::Library) -> i32 {
     }
 }
 
+/// Read the clip folder with the threads' shared library (see `scanner`),
+/// opening it when this is the first to want it.
+fn rescan_shared(scanner: &Mutex<Option<lib::Library>>) -> i32 {
+    // Whoever held it last only read the folder with it.
+    let mut held = scanner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if held.is_none() {
+        *held = open_db();
+    }
+    held.as_ref().map_or(0, rescan_now)
+}
+
 fn clip_dir() -> PathBuf {
-    Config::load(&paths::config_file()).unwrap_or_default().library.dir
+    Config::load_usable(&paths::config_file()).library.dir
 }
 
 impl LibraryRust {
@@ -340,9 +356,10 @@ impl ffi::Library {
             return;
         }
         let qt = self.qt_thread();
+        let scanner = self.scanner.clone();
         std::thread::spawn(move || {
-            // Its own connection: the window's stays on the window's thread.
-            let changed = open_db().as_ref().map_or(0, rescan_now);
+            // Not the window's connection, which stays on the window's thread.
+            let changed = rescan_shared(&scanner);
             scanning.store(false, Ordering::SeqCst);
             let _ = qt.queue(move |library| library.rescan_finished(changed));
         });
@@ -463,12 +480,11 @@ impl ffi::Library {
             files.to_string().lines().filter(|l| !l.is_empty()).map(|l| PathBuf::from(ffi::local_path_of(&QString::from(l)).to_string())).collect();
         let game = game.to_string();
         let qt = self.qt_thread();
+        let scanner = self.scanner.clone();
         // A long video takes a while to copy.
         std::thread::spawn(move || {
             let (added, problem) = import_now(&files, &game);
-            if let Some(db) = open_db() {
-                rescan_now(&db);
-            }
+            rescan_shared(&scanner);
             let _ = qt.queue(move |library| library.imported(added, QString::from(&problem)));
         });
     }

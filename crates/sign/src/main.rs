@@ -11,6 +11,11 @@
 //! from the file `ZENITH_SIGNING_KEY_FILE` names. `ZENITH_SIGNING_PASSWORD`
 //! is its password, when it has one. Installed copies accept updates signed
 //! with this key and nothing else: keep it, and keep it to yourself.
+//!
+//! Which key that is, is written in `app/update.pub`, and the app is built
+//! with that file. So is this program: what it signs it checks against
+//! the same file, and a release signed with any other key (which no
+//! installed copy could install) is refused here, not found out later.
 
 use minisign::{KeyPair, PublicKey, SecretKey, SecretKeyBox};
 use std::collections::BTreeMap;
@@ -22,6 +27,9 @@ use zenith_core::update::{self, File, Manifest};
 /// The kinds of computer a release may have a file for.
 const TARGETS: [&str; 2] = ["linux-x86_64", "windows-x86_64"];
 
+/// The keys installed copies accept updates from: what the app is built with.
+const TRUSTED: &str = include_str!("../../../app/update.pub");
+
 type Outcome<T> = Result<T, String>;
 
 fn password() -> Option<String> {
@@ -29,21 +37,36 @@ fn password() -> Option<String> {
 }
 
 fn keygen(file: &Path) -> Outcome<String> {
+    use std::io::Write;
+    let taken = || format!("{} is already there; a new key would lock every installed copy out of updates", file.display());
     if file.exists() {
-        return Err(format!("{} is already there; a new key would lock every installed copy out of updates", file.display()));
+        return Err(taken());
     }
     let pair = match password() {
         Some(password) => KeyPair::generate_encrypted_keypair(Some(password)),
-        None => KeyPair::generate_unencrypted_keypair(),
+        None => {
+            // Said where it cannot be missed: whoever reads the file has the key.
+            eprintln!("zenith-sign: WARNING: ZENITH_SIGNING_PASSWORD is not set, so the key in {} is NOT ENCRYPTED.", file.display());
+            eprintln!("zenith-sign: WARNING: anyone who can read that file can sign updates. Set a password and make the key again, unless that is meant.");
+            KeyPair::generate_unencrypted_keypair()
+        }
     }
     .map_err(|e| e.to_string())?;
     let text = pair.sk.to_box(Some("Zenith update key")).map_err(|e| e.to_string())?.into_string();
-    std::fs::write(file, text).map_err(|e| format!("{} could not be written: {e}", file.display()))?;
+    // Made new, and the owner's alone from the start: it is never, even
+    // for a moment, a file others can read, and never written over one.
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600));
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
+    let mut made = options.open(file).map_err(|e| match e.kind() {
+        std::io::ErrorKind::AlreadyExists => taken(),
+        _ => format!("{} could not be written: {e}", file.display()),
+    })?;
+    made.write_all(text.as_bytes()).and_then(|_| made.sync_all()).map_err(|e| format!("{} could not be written: {e}", file.display()))?;
     Ok(pair.pk.to_base64())
 }
 
@@ -63,8 +86,10 @@ fn secret_key() -> Outcome<SecretKey> {
     .map_err(|e| format!("the key could not be opened: {e}"))
 }
 
-/// Sign `file`: the text of its `.minisig`, which names the file.
-fn sign(key: &SecretKey, file: &Path) -> Outcome<String> {
+/// Sign `file`: the text of its `.minisig`, which names the file. The
+/// signature has to be one that `trusted` (the text of an `update.pub`)
+/// accepts, or there is none.
+fn sign(key: &SecretKey, file: &Path, trusted: &str) -> Outcome<String> {
     let name = file.file_name().and_then(|n| n.to_str()).ok_or_else(|| format!("{} has no name", file.display()))?;
     let data = std::fs::read(file).map_err(|e| format!("{} could not be read: {e}", file.display()))?;
     let public = PublicKey::from_secret_key(key).map_err(|e| e.to_string())?;
@@ -72,8 +97,16 @@ fn sign(key: &SecretKey, file: &Path) -> Outcome<String> {
     let signature = minisign::sign(Some(&public), key, Cursor::new(&data), Some(&update::trusted_comment(name, seconds)), Some("signed with the Zenith update key"))
         .map_err(|e| format!("signing failed: {e}"))?
         .into_string();
-    // Checked the way the app will check it, before it goes out.
-    update::verify(&public.to_base64(), &signature, name, &data).map_err(|e| e.to_string())?;
+    // Checked the way the app will check it, against the keys the app is
+    // built with, before it goes out: signed with another key, it would
+    // be a release that nobody can install.
+    update::verify(trusted, &signature, name, &data).map_err(|e| match e {
+        update::UpdateError::NotOurs | update::UpdateError::NoKey => format!(
+            "the signing key is not one that app/update.pub names, so no installed copy would accept {name}. Its public half is {}",
+            public.to_base64()
+        ),
+        other => other.to_string(),
+    })?;
     Ok(signature)
 }
 
@@ -103,7 +136,7 @@ fn run(args: &[String]) -> Outcome<()> {
         ["sign", files @ ..] if !files.is_empty() => {
             let key = secret_key()?;
             for file in files {
-                let signature = sign(&key, Path::new(file))?;
+                let signature = sign(&key, Path::new(file), TRUSTED)?;
                 let out = format!("{file}.minisig");
                 std::fs::write(&out, signature).map_err(|e| format!("{out} could not be written: {e}"))?;
                 println!("signed {file}");
@@ -142,8 +175,9 @@ mod tests {
         let pair = KeyPair::generate_unencrypted_keypair().unwrap();
         let name = update::file_name("0.2.0", "linux-x86_64");
         std::fs::write(dir.path().join(&name), b"the programs").unwrap();
-        let signature = sign(&pair.sk, &dir.path().join(&name)).unwrap();
-        assert_eq!(update::verify(&pair.pk.to_base64(), &signature, &name, b"the programs"), Ok(()));
+        let trusted = format!("# the keys\n{}\n", pair.pk.to_base64());
+        let signature = sign(&pair.sk, &dir.path().join(&name), &trusted).unwrap();
+        assert_eq!(update::verify(&trusted, &signature, &name, b"the programs"), Ok(()));
 
         let made = manifest("0.2.0", "Faster.\n", dir.path()).unwrap();
         assert_eq!(made.files["linux-x86_64"], File { name, size: 12 });
@@ -152,11 +186,34 @@ mod tests {
     }
 
     #[test]
-    fn a_key_is_made_once() {
+    fn a_key_the_app_does_not_trust_signs_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ours, another) = (KeyPair::generate_unencrypted_keypair().unwrap(), KeyPair::generate_unencrypted_keypair().unwrap());
+        let file = dir.path().join(update::file_name("0.2.0", "linux-x86_64"));
+        std::fs::write(&file, b"the programs").unwrap();
+        let trusted = format!("{}\n", ours.pk.to_base64());
+        let why = sign(&another.sk, &file, &trusted).unwrap_err();
+        assert!(why.contains("app/update.pub") && why.contains(&another.pk.to_base64()), "{why}");
+        assert!(sign(&another.sk, &file, "# no key at all\n").is_err());
+        assert!(sign(&ours.sk, &file, &trusted).is_ok());
+        // A new key is not the one this build trusts either, until its
+        // public half is put in app/update.pub.
+        assert!(sign(&another.sk, &file, TRUSTED).is_err());
+    }
+
+    #[test]
+    fn a_key_is_made_once_and_is_the_owners_alone() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("zenith-updates.key");
         let public = keygen(&file).unwrap();
         assert!(PublicKey::from_base64(&public).is_ok());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        let before = std::fs::read(&file).unwrap();
         assert!(keygen(&file).is_err(), "an existing key is never written over");
+        assert_eq!(std::fs::read(&file).unwrap(), before);
     }
 }

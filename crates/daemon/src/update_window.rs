@@ -9,7 +9,9 @@
 //! any window of its own and shows a small one of Zenith's meanwhile, in
 //! the colours the user chose, with a bar that moves until it is done.
 //! If the setup program fails, the window says so and the app that was
-//! there is opened again.
+//! there is opened again, if it is still there. A setup program that never
+//! ends is not waited for without end: after a long while the window says
+//! so and can be clicked away.
 
 use crate::overlay::{monitor_of, rgb, wide};
 use std::process::ExitCode;
@@ -24,7 +26,7 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetClientRect, GetForegroundWindow, GetMessageW, GetWindowLongPtrW,
     KillTimer, MSG, PostMessageW, PostQuitMessage, RegisterClassW, SW_SHOW, SetTimer, SetWindowLongPtrW, ShowWindow, TranslateMessage, WM_APP, WM_DESTROY,
-    WM_ERASEBKGND, WM_PAINT, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WM_ERASEBKGND, WM_LBUTTONUP, WM_PAINT, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use zenith_core::config::{Config, Look, rgb as parse};
 
@@ -32,8 +34,16 @@ use zenith_core::config::{Config, Look, rgb as parse};
 const MOVE: usize = 1;
 const CLOSE: usize = 2;
 /// Sent to the window by the thread running the setup program when that
-/// has ended; `wparam` is 0 when it worked.
+/// has ended, or has been waited for long enough; `wparam` is how it went.
 const DONE: u32 = WM_APP + 1;
+/// How the setup program went, as `DONE` carries it.
+const WORKED: usize = 0;
+const FAILED: usize = 1;
+const STUCK: usize = 2;
+/// How long the setup program gets. It takes a few seconds; one still
+/// running after this is waiting for something that will not come, and
+/// the window, which stays above every other, must not stay for good.
+const SETUP_WITHIN: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// The window's colours: Zenith's, or the user's own where they chose some.
 struct Colours {
@@ -84,6 +94,10 @@ struct Shown {
     moved: u32,
     /// The setup program has ended; the bar is gone.
     ended: bool,
+    /// It did not go well: a click closes the window.
+    closes_on_click: bool,
+    /// Whether the app that was there can be opened again.
+    app_is_there: bool,
     scale: f64,
 }
 
@@ -181,16 +195,31 @@ unsafe extern "system" fn handle(window: HWND, message: u32, wparam: WPARAM, lpa
             DONE => {
                 KillTimer(window, MOVE);
                 (*shown).ended = true;
-                let worked = wparam == 0;
-                if worked {
-                    (*shown).detail = wide("Done. Opening Zenith\u{2026}");
-                } else {
-                    (*shown).title = wide("The update did not go in");
-                    (*shown).detail = wide("Zenith is as it was, and opens again in a moment.");
+                (*shown).closes_on_click = wparam != WORKED;
+                // What the setup program got done before it failed is not
+                // known here: only whether there is an app to open.
+                match wparam {
+                    WORKED => (*shown).detail = wide("Done. Opening Zenith\u{2026}"),
+                    STUCK => {
+                        (*shown).title = wide("The update is taking too long");
+                        (*shown).detail = wide("Click to close this. If Zenith does not open, install it again.");
+                    }
+                    _ => {
+                        (*shown).title = wide("The update did not go in");
+                        (*shown).detail = wide(if (*shown).app_is_there {
+                            "Zenith opens again in a moment. Click to close this."
+                        } else {
+                            "Zenith needs installing again. Click to close this."
+                        });
+                    }
                 }
                 InvalidateRect(window, null(), 0);
                 // Long enough to read, and for the app's window to come up.
-                SetTimer(window, CLOSE, if worked { 1500 } else { 6000 }, None);
+                SetTimer(window, CLOSE, if wparam == WORKED { 1500 } else { 15000 }, None);
+                0
+            }
+            WM_LBUTTONUP if (*shown).closes_on_click => {
+                DestroyWindow(window);
                 0
             }
             WM_DESTROY => {
@@ -217,7 +246,7 @@ pub fn run(setup: &str, version: &str, app: &str) -> ExitCode {
     // this thread fetching its messages; every pointer handed over
     // outlives the call it is handed to. The other thread is given the
     // window only as a number to post a message to.
-    let worked = unsafe {
+    let went = unsafe {
         let class = wide("ZenithUpdate");
         let program = GetModuleHandleW(null());
         let mut kind: WNDCLASSW = std::mem::zeroed();
@@ -245,6 +274,8 @@ pub fn run(setup: &str, version: &str, app: &str) -> ExitCode {
             detail: wide("This takes a moment. Zenith opens again by itself."),
             moved: 0,
             ended: false,
+            closes_on_click: false,
+            app_is_there: !app.is_empty() && std::path::Path::new(app).is_file(),
             scale,
         }));
         if window.is_null() {
@@ -257,15 +288,36 @@ pub fn run(setup: &str, version: &str, app: &str) -> ExitCode {
 
         let (setup, to) = (setup.to_string(), window as isize);
         let installing = std::thread::spawn(move || {
-            let ended = std::process::Command::new(&setup).args(["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"]).status();
-            let worked = ended.as_ref().is_ok_and(|status| status.success());
-            if !worked {
-                crate::warn(format_args!("zenithd: the setup program {setup} did not finish: {ended:?}"));
+            let began = std::time::Instant::now();
+            let mut running = std::process::Command::new(&setup).args(["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"]).spawn();
+            // Looked in on rather than waited for, so that the wait has an end.
+            let ended = loop {
+                match &mut running {
+                    Err(e) => break Some(Err(std::io::Error::new(e.kind(), e.to_string()))),
+                    Ok(child) => match child.try_wait() {
+                        Ok(Some(status)) => break Some(Ok(status)),
+                        Ok(None) if began.elapsed() < SETUP_WITHIN => std::thread::sleep(std::time::Duration::from_millis(100)),
+                        // It is left running: ending a setup program
+                        // half way through is worse than letting it be.
+                        Ok(None) => break None,
+                        Err(e) => break Some(Err(e)),
+                    },
+                }
+            };
+            let went = match &ended {
+                Some(Ok(status)) if status.success() => WORKED,
+                Some(_) => FAILED,
+                None => STUCK,
+            };
+            match went {
+                WORKED => {}
+                STUCK => crate::warn(format_args!("zenithd: the setup program {setup} is still running after {} s; no longer waiting for it", SETUP_WITHIN.as_secs())),
+                _ => crate::warn(format_args!("zenithd: the setup program {setup} did not finish: {ended:?}")),
             }
             if to != 0 {
-                PostMessageW(to as HWND, DONE, usize::from(!worked), 0);
+                PostMessageW(to as HWND, DONE, went, 0);
             }
-            (worked, setup)
+            (went, setup)
         });
 
         if !window.is_null() {
@@ -275,18 +327,23 @@ pub fn run(setup: &str, version: &str, app: &str) -> ExitCode {
                 DispatchMessageW(&message);
             }
         }
-        let (worked, setup) = installing.join().unwrap_or((false, String::new()));
+        let (went, setup) = installing.join().unwrap_or((FAILED, String::new()));
         drop(Box::from_raw(shown));
-        if worked {
+        if went == WORKED {
             // It has done its work.
             let _ = std::fs::remove_file(format!("{setup}.minisig"));
             let _ = std::fs::remove_file(setup);
         }
-        worked
+        went
     };
-    if worked {
+    if went == WORKED {
         crate::warn(format_args!("zenithd: the setup program finished; Zenith {version} is in place"));
         return ExitCode::SUCCESS;
+    }
+    // Still running, it may yet finish and open the new app itself; the
+    // old one opened under it would only be in its way.
+    if went == STUCK {
+        return ExitCode::FAILURE;
     }
     if !app.is_empty()
         && let Err(e) = std::process::Command::new(app).spawn()

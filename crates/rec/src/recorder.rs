@@ -1,22 +1,25 @@
 //! The recording: ffmpeg kept running and fed, its ring kept to size, and
 //! the words on stdin carried out. `save` joins the newest pieces into a
-//! clip and prints its path; `stop`, or stdin ending because the daemon is
-//! gone, ends the recording.
+//! clip and prints its path, or `save-failed: ` and why there is no clip;
+//! `stop`, or stdin ending because the daemon is gone, ends the recording.
 //!
 //! What is recorded is the monitor `-w` names, until a game's window is on
 //! screen: then that window alone is, for as long as it is there. Started
 //! because a game was (`-wait-for-game`), nothing is recorded until that
 //! window first appears: the desktop while a game starts up is no clip. Each
 //! change is a new ffmpeg writing on into the same ring, in the same
-//! encoding and size, so a clip that spans one still joins.
+//! encoding and size, so a clip that spans one still joins. When the size
+//! or the encoder has to change (the monitor was given another mode), the
+//! ring starts over: a clip never joins pieces of two kinds.
 
 use crate::args::{Codec, Options};
 use crate::audio::processes::{self, ProcessTable};
 use crate::ffmpeg::{self, Abilities, Encoder, Family, Frames, Grab, Video};
 use crate::game_window::{self, Rules, Window};
 use crate::mixer::{self, Sink};
+use crate::monitors::Monitor;
 use crate::sys::ChildLeash;
-use crate::{monitors, note, ring};
+use crate::{monitors, note, ring, sys};
 use std::collections::VecDeque;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -52,6 +55,38 @@ const LEAVE_ALONE: Duration = Duration::from_secs(60);
 /// fill in for a window that shows nothing new: the monitor is recorded
 /// instead, sooner than `STALL` would have it.
 const WINDOW_STALL: Duration = Duration::from_secs(5);
+
+/// How long the way of recording the monitor that was settled for is kept
+/// before the one this recording began with is tried again, the first
+/// time: the lock screen and the like, where only the copying of pixels
+/// works, do not last.
+const BETTER_AFTER: Duration = Duration::from_secs(5 * 60);
+/// Each try is made twice as long after the last, up to this: a way that
+/// only seems to work again costs a moment of the buffer every time.
+const BETTER_AT_MOST: Duration = Duration::from_secs(3600);
+/// How often the room left on the ring's disk is looked at.
+const DISK_EVERY: Duration = Duration::from_secs(5);
+/// What a track of sound comes to in the pieces, in kbit/s.
+const SOUND_KBPS: u64 = 192;
+/// The most the ring may come to. More than this was not meant: a day of
+/// buffer asked for by mistake would otherwise fill the disk before
+/// anything said so.
+pub const MAX_RING_BYTES: u64 = 32 << 30;
+/// What has to be left on the ring's disk beside a full ring for the
+/// recording to begin.
+pub const ROOM_TO_SPARE: u64 = 256 << 20;
+/// With less than this left on the ring's disk, the recording ends: the
+/// next pieces would not fit, and ffmpeg would only be started over and
+/// over.
+pub const LEAST_ROOM: u64 = 64 << 20;
+/// How every reason for ending that is about the disk begins: the daemon
+/// can tell it from any other by this, and by the exit code.
+pub const NO_ROOM: &str = "no room on the disk";
+/// The exit code of a recording that ended for want of room on the disk.
+pub const NO_ROOM_CODE: u8 = 3;
+/// How the line on stdout begins that says a clip could not be saved, in
+/// place of the clip's path: the reason follows it.
+pub const SAVE_FAILED: &str = "save-failed: ";
 
 /// How long the game's window is waited for before anything is recorded
 /// (`-wait-for-game`). A game whose window never shows as one is then
@@ -92,6 +127,99 @@ pub fn restart_delay(short_runs: u32) -> Duration {
     Duration::from_millis(500 * short_runs.clamp(1, 8) as u64)
 }
 
+/// The line on stdout for a clip that could not be saved. Never a path, so
+/// a reader that only knows paths passes over it.
+pub fn save_failed_line(why: &str) -> String {
+    format!("{SAVE_FAILED}{}", why.replace(['\n', '\r'], " "))
+}
+
+/// The clips in `dir` that were being written when a recorder was ended:
+/// `Replay_….mp4.part`, which no finished clip is ever called.
+pub fn stale_partials(dir: &Path) -> Vec<PathBuf> {
+    let ours = |name: &str| name.starts_with("Replay_") && name.ends_with(".mp4.part");
+    let mut found: Vec<PathBuf> =
+        std::fs::read_dir(dir).into_iter().flatten().flatten().filter(|entry| ours(&entry.file_name().to_string_lossy())).map(|entry| entry.path()).collect();
+    found.sort();
+    found
+}
+
+/// What the ring comes to on disk when it is full, in bytes: the picture
+/// and each track of sound for the buffer and the pieces kept beyond it,
+/// and a fifth more for what the container adds and the encoder overshoots.
+pub fn ring_bytes(bitrate_kbps: u32, tracks: usize, buffer_secs: u32) -> u64 {
+    let a_second = (bitrate_kbps as u64 + tracks as u64 * SOUND_KBPS) * 1000 / 8;
+    a_second * (buffer_secs as u64 + ring::SPARE as u64) * 6 / 5
+}
+
+fn megabytes(bytes: u64) -> u64 {
+    bytes / 1_000_000
+}
+
+/// Whether a ring of `ring` bytes may be begun with `free` bytes left on
+/// its disk (`None`: it cannot be told), and if not, why.
+pub fn room_to_begin(ring: u64, free: Option<u64>) -> Result<(), String> {
+    if ring > MAX_RING_BYTES {
+        return Err(format!("{NO_ROOM} for a buffer this long: it would come to {} MB, and {} MB is the most one may", megabytes(ring), megabytes(MAX_RING_BYTES)));
+    }
+    match free {
+        Some(free) if free < ring + ROOM_TO_SPARE => {
+            Err(format!("{NO_ROOM} for the replay buffer: it needs about {} MB and {} MB are free", megabytes(ring + ROOM_TO_SPARE), megabytes(free)))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Whether a recording may go on with `free` bytes left on its ring's disk.
+pub fn room_to_go_on(free: Option<u64>) -> Result<(), String> {
+    match free {
+        Some(free) if free < LEAST_ROOM => Err(format!("{NO_ROOM} the replay buffer is on: {} MB are left", megabytes(free))),
+        _ => Ok(()),
+    }
+}
+
+/// Whether a clip of `bytes` fits where `free` bytes are left.
+pub fn room_for_clip(bytes: u64, free: Option<u64>) -> Result<(), String> {
+    // The index and the container's own words, beside the pieces.
+    let needed = bytes + bytes / 20 + (8 << 20);
+    match free {
+        Some(free) if free < needed => Err(format!("{NO_ROOM} for the clip: it needs about {} MB and {} MB are free", megabytes(needed), megabytes(free))),
+        _ => Ok(()),
+    }
+}
+
+/// Whether two ways of making the video are the same way, whatever
+/// monitor or size they are of.
+fn same_way(a: &Video, b: &Video) -> bool {
+    a.grab.name() == b.grab.name() && a.frames == b.frames && a.encoder == b.encoder
+}
+
+/// How long after a try of the better way the next one is made.
+pub fn next_better_wait(wait: Duration) -> Duration {
+    (wait * 2).min(BETTER_AT_MOST)
+}
+
+/// `screen`, the way a monitor is recorded, for `monitor` as it is now:
+/// its place, handle and size may have changed since the way was chosen (a
+/// game gave it another mode). `wanted` is the size asked for with `-s`.
+/// With it, the size of the picture. `None` when the way cannot be kept
+/// and another has to be chosen.
+fn screen_now(screen: &Video, monitor: &Monitor, wanted: Option<(u32, u32)>) -> Option<(Video, (u32, u32))> {
+    let scale = wanted.filter(|size| *size != monitor.size);
+    let grab = match &screen.grab {
+        // Now on another graphics card, when it has no place on the first.
+        Grab::Ddagrab { .. } => Grab::Ddagrab { output_idx: monitor.output_idx? },
+        Grab::Gfxcapture { .. } => Grab::Gfxcapture { hmonitor: monitor.handle },
+        Grab::Gdigrab { .. } => Grab::Gdigrab { origin: monitor.origin, size: monitor.size },
+        // Not of a monitor.
+        Grab::Test { .. } | Grab::Window { .. } => return None,
+    };
+    // Nothing in ffmpeg scales Direct3D frames in place.
+    if matches!(grab, Grab::Ddagrab { .. }) && screen.frames == Frames::Gpu && scale.is_some() {
+        return None;
+    }
+    Some((Video { grab, scale, ..screen.clone() }, scale.unwrap_or(monitor.size)))
+}
+
 /// A test recording: the test picture through the software encoder of the
 /// codec asked for (libx264 when this ffmpeg has no other), so that every
 /// kind of piece the ring can hold is made for real in the tests.
@@ -112,16 +240,25 @@ fn test_video(options: &Options, has: &Abilities) -> Video {
     }
 }
 
+/// A way of recording the monitor that works.
+struct Chosen {
+    video: Video,
+    /// The size of the picture it makes.
+    canvas: (u32, u32),
+    /// The name of the monitor it is of: `-w screen` may mean another one
+    /// tomorrow, and this recording stays with the one it began on.
+    monitor: String,
+}
+
 /// Try each way of capturing and encoding for a second and take the first
 /// that works. A codec nothing here can encode gives way to H.264: a clip
-/// in another codec is better than no clip. With it, the size of the
-/// picture it makes.
-fn choose_video(ffmpeg: &Path, has: &Abilities, options: &Options) -> Result<(Video, (u32, u32)), String> {
+/// in another codec is better than no clip.
+fn choose_video(ffmpeg: &Path, has: &Abilities, options: &Options) -> Result<Chosen, String> {
     if monitors::test_source() {
         note!("test picture in place of a screen, encoded in software");
         let video = test_video(options, has);
         let Grab::Test { size } = video.grab else { return Err("the test picture has no size".into()) };
-        return Ok((video, size));
+        return Ok(Chosen { video, canvas: size, monitor: monitors::TEST_NAME.to_string() });
     }
     let all = monitors::list();
     for m in &all {
@@ -151,7 +288,7 @@ fn choose_video(ffmpeg: &Path, has: &Abilities, options: &Options) -> Result<(Vi
             match ffmpeg::run_quietly(ffmpeg, &ffmpeg::probe_args(&video), ffmpeg::PROBE_LIMIT) {
                 Ok(()) => {
                     note!("{} works ({} ms)", video.describe(), began.elapsed().as_millis());
-                    return Ok((video, scale.unwrap_or(monitor.size)));
+                    return Ok(Chosen { video, canvas: scale.unwrap_or(monitor.size), monitor: monitor.name.clone() });
                 }
                 Err(err) => note!("{} does not work here: {err}", video.describe()),
             }
@@ -299,6 +436,17 @@ struct Recorder {
     screen: Video,
     /// The size of every picture, whatever it is of.
     canvas: (u32, u32),
+    /// The name of the monitor that is recorded.
+    monitor: String,
+    /// How the monitor was recorded when this recording began: the way to
+    /// go back to when another had to be settled for.
+    first: Video,
+    /// When the way this began with is tried again, while another is used.
+    better_at: Option<Instant>,
+    /// How long after this try the next one is made.
+    better_wait: Duration,
+    /// When the room left on the ring's disk was last looked at.
+    disk_looked: Instant,
     /// `None` when a game's window cannot be told or recorded here.
     follow: Option<Follow>,
     /// The game's window being recorded.
@@ -313,7 +461,7 @@ struct Recorder {
     out_dir: PathBuf,
     ring: PathBuf,
     sink: Arc<Mutex<Sink>>,
-    leash: ChildLeash,
+    leash: &'static ChildLeash,
     audio_offset_ms: i64,
     running: Option<Running>,
     /// When to start ffmpeg again, while it is not running.
@@ -329,12 +477,126 @@ impl Recorder {
         self.options.audio.len()
     }
 
+    /// Take `video` as the way the monitor is recorded from now on, making
+    /// pictures of `canvas` size. Pieces of another size or encoder would
+    /// not join with what comes now: the ring starts over then, and a clip
+    /// reaches back to this moment at the most.
+    fn adopt(&mut self, video: Video, canvas: (u32, u32)) {
+        let another_kind = canvas != self.canvas || video.encoder != self.screen.encoder;
+        if another_kind {
+            note!(
+                "the picture is now {}x{} with {} (it was {}x{} with {}): the two do not join, so the buffer starts over and what was in it is lost",
+                canvas.0,
+                canvas.1,
+                video.encoder.name,
+                self.canvas.0,
+                self.canvas.1,
+                self.screen.encoder.name
+            );
+            ring::clear(&self.ring);
+            if let Some(follow) = self.follow.as_mut() {
+                follow.frames = None;
+            }
+        }
+        self.canvas = canvas;
+        self.screen = video;
+        match &mut self.video.grab {
+            // The game's window goes on being recorded, into the size the
+            // pictures have now.
+            Grab::Window { canvas: of_window, .. } if !another_kind => *of_window = canvas,
+            Grab::Window { .. } => {
+                // With another encoder: the window is found again, and its way tried over.
+                self.video = self.screen.clone();
+                self.target = None;
+            }
+            _ => self.video = self.screen.clone(),
+        }
+    }
+
+    /// Note which way the monitor is recorded now: when it is not the one
+    /// this recording began with, that one is tried again after a while.
+    fn settle(&mut self) {
+        if same_way(&self.screen, &self.first) {
+            self.better_at = None;
+        } else if self.better_at.is_none() {
+            note!("{} is tried again in {} min", self.first.describe(), self.better_wait.as_secs() / 60);
+            self.better_at = Some(Instant::now() + self.better_wait);
+        }
+    }
+
+    /// Choose over again how the monitor is recorded.
+    fn choose_again(&mut self) -> Result<(), String> {
+        let chosen = choose_video(&self.ffmpeg, &self.has, &self.options)?;
+        self.monitor = chosen.monitor;
+        self.adopt(chosen.video, chosen.canvas);
+        self.settle();
+        Ok(())
+    }
+
+    /// Before the monitor is recorded again: look at it as it is now. A
+    /// game may have given it another mode since the way to record it was
+    /// chosen, and an ffmpeg started for the old one would make pictures
+    /// of another size, or none.
+    fn look_at_the_monitor(&mut self) -> Result<(), String> {
+        if monitors::test_source() || self.target.is_some() {
+            return Ok(());
+        }
+        let all = monitors::list();
+        // Gone for now: the start fails, and after a few the ways are tried over.
+        let Some(monitor) = monitors::pick(&self.monitor, &all) else { return Ok(()) };
+        match screen_now(&self.screen, monitor, self.options.size) {
+            Some((video, canvas)) if video == self.screen && canvas == self.canvas => {}
+            Some((video, canvas)) => {
+                note!("{} is now {}x{} at {},{}: recorded as it is now", monitor.name, monitor.size.0, monitor.size.1, monitor.origin.0, monitor.origin.1);
+                self.adopt(video, canvas);
+            }
+            None => {
+                note!("{} is now {}x{} and cannot be recorded as before: choosing how to record over again", monitor.name, monitor.size.0, monitor.size.1);
+                self.choose_again()?;
+                say_way(&self.video, self.options.buffer_secs);
+            }
+        }
+        Ok(())
+    }
+
+    /// Try the way this recording began with, while another is used: for
+    /// one second, beside the ffmpeg that is recording. When it works
+    /// again, it is gone back to.
+    fn try_better(&mut self) {
+        if self.running.is_none() || !self.better_at.is_some_and(|at| Instant::now() >= at) {
+            return;
+        }
+        // Whatever comes of it, the next try is further off: this cannot go round and round.
+        self.better_wait = next_better_wait(self.better_wait);
+        self.better_at = Some(Instant::now() + self.better_wait);
+        let all = monitors::list();
+        let now = monitors::pick(&self.monitor, &all).and_then(|monitor| screen_now(&self.first, monitor, self.options.size));
+        let Some((video, canvas)) = now else {
+            note!("{} does not fit the monitor as it is now; looked at again in {} min", self.first.describe(), self.better_wait.as_secs() / 60);
+            return;
+        };
+        if let Err(err) = ffmpeg::run_quietly(&self.ffmpeg, &ffmpeg::probe_args(&video), ffmpeg::PROBE_LIMIT) {
+            note!("{} still does not work ({err}); tried again in {} min", video.describe(), self.better_wait.as_secs() / 60);
+            return;
+        }
+        note!("{} works again: going back to it from {}", video.describe(), self.screen.describe());
+        self.adopt(video, canvas);
+        // Should it not stay up after all, the ways are tried over once more.
+        self.chosen_again = false;
+        if self.target.is_none() {
+            self.record(self.screen.clone(), None);
+        }
+        // Left as it is until the next try, should this one not last.
+        self.better_at = None;
+    }
+
     fn start(&mut self) -> Result<(), String> {
+        self.look_at_the_monitor()?;
         let first = ring::next_start(&ring::indices(&self.ring));
         let args = ffmpeg::record_args(&self.video, self.tracks(), &self.ring, first, self.audio_offset_ms);
         note!("starting: {}", ffmpeg::shown(&self.ffmpeg, &args));
         let stdin = if self.tracks() > 0 { Stdio::piped() } else { Stdio::null() };
-        let mut child = ffmpeg::command(&self.ffmpeg)
+        let mut child = ffmpeg::recording_command(&self.ffmpeg)
             .args(&args)
             .stdin(stdin)
             .stdout(Stdio::null())
@@ -466,6 +728,16 @@ impl Recorder {
         for index in ring::expired(&indices, self.options.buffer_secs) {
             let _ = std::fs::remove_file(self.ring.join(ring::piece_name(*index, self.video.container())));
         }
+        if self.disk_looked.elapsed() >= DISK_EVERY {
+            self.disk_looked = Instant::now();
+            // Said and ended here: left to itself a full disk is an ffmpeg
+            // that ends as it starts, over and over, and says nothing clear.
+            room_to_go_on(sys::free_bytes(&self.ring))?;
+        }
+        self.try_better();
+        // Owed more sound than is worth writing as silence (the machine
+        // slept): started afresh, it counts from now.
+        let behind = self.sink.lock().is_ok_and(|sink| sink.fell_behind());
         let Some(running) = self.running.as_mut() else {
             if self.restart_at.is_some_and(|at| Instant::now() >= at) {
                 self.restart_at = None;
@@ -484,6 +756,7 @@ impl Recorder {
             // Not before it has had the time to start that any ffmpeg gets.
             Ok(None) if quiet > STALL || (quiet > stall && ran > STALL) => (Some(format!("wrote nothing for {} s", quiet.as_secs())), true, false),
             Ok(None) if ran > MAX_RUN => (Some("has run for 20 hours and is started afresh".to_string()), false, true),
+            Ok(None) if behind => (Some("is owed more sound than can be made up for and is started afresh".to_string()), false, true),
             Ok(None) => (None, false, false),
             Err(err) => (Some(format!("cannot be asked how it is ({err})")), false, false),
         };
@@ -518,18 +791,8 @@ impl Recorder {
                 return Err(format!("ffmpeg will not stay up: {tail}"));
             }
             note!("ffmpeg will not stay up: choosing how to record over again");
-            let (video, canvas) = choose_video(&self.ffmpeg, &self.has, &self.options)?;
-            if canvas != self.canvas || video.encoder != self.screen.encoder {
-                // What is in the ring would not join with what comes now.
-                note!("the picture is now {}x{} with {}: the buffer starts over", canvas.0, canvas.1, video.encoder.name);
-                ring::clear(&self.ring);
-                if let Some(follow) = self.follow.as_mut() {
-                    follow.frames = None;
-                }
-            }
-            self.canvas = canvas;
-            self.screen = video.clone();
-            self.record(video, None);
+            self.choose_again()?;
+            self.record(self.screen.clone(), None);
             return Ok(());
         }
         if ran >= HEALTHY_AFTER {
@@ -574,14 +837,18 @@ impl Recorder {
             return Err("nothing has been recorded yet".into());
         };
         let waited = began.elapsed();
-        let list = self.ring.join(ring::LIST_NAME);
-        std::fs::write(&list, ring::concat_list(&pieces, self.video.container())).map_err(|err| format!("the list of pieces could not be written: {err}"))?;
         std::fs::create_dir_all(&self.out_dir).map_err(|err| format!("{} could not be made: {err}", self.out_dir.display()))?;
+        let container = self.video.container();
+        let size: u64 = pieces.iter().map(|index| std::fs::metadata(self.ring.join(ring::piece_name(*index, container))).map_or(0, |m| m.len())).sum();
+        room_for_clip(size, sys::free_bytes(&self.out_dir))?;
+        let list = self.ring.join(ring::LIST_NAME);
+        std::fs::write(&list, ring::concat_list(&pieces, container)).map_err(|err| format!("the list of pieces could not be written: {err}"))?;
         let name = clip_name(chrono::Local::now().naive_local(), |name| self.out_dir.join(name).exists());
         let out = self.out_dir.join(&name);
         // Written under another name and renamed: nobody sees half a clip.
         let partial = self.out_dir.join(format!("{name}.part"));
-        let joined = ffmpeg::run_quietly(&self.ffmpeg, &ffmpeg::join_args(&list, &partial, self.video.encoder.codec), ffmpeg::JOIN_LIMIT);
+        // A long buffer is a big clip, and is given the time to be written.
+        let joined = ffmpeg::run_quietly(&self.ffmpeg, &ffmpeg::join_args(&list, &partial, self.video.encoder.codec), ffmpeg::join_limit(size));
         let _ = std::fs::remove_file(&list);
         if let Err(err) = joined {
             let _ = std::fs::remove_file(&partial);
@@ -621,9 +888,12 @@ fn listen(words: mpsc::Sender<Word>) {
     });
 }
 
+/// End for `what`. It is said again as the very last line: the last
+/// thing a recorder said is what the daemon shows for why it ended. For
+/// want of room on the disk it ends with a code of its own.
 fn failed(what: &str) -> ExitCode {
     note!("giving up: {what}");
-    ExitCode::FAILURE
+    if what.starts_with(NO_ROOM) { ExitCode::from(NO_ROOM_CODE) } else { ExitCode::FAILURE }
 }
 
 /// Record until told to stop.
@@ -631,6 +901,15 @@ pub fn run(options: Options) -> ExitCode {
     crate::log::init(&crate::sys::logs_dir());
     note!("zenith-rec {} on {}", env!("CARGO_PKG_VERSION"), crate::sys::os_description());
     note!("asked for: {options:?}");
+    if options.hdr_asked {
+        note!("HDR or 10 bits were asked for and are not recorded: the clips are plain 8-bit {}", options.codec.as_str());
+    }
+    let ring_dir = sys::ring_dir();
+    // Before anything is started: a ring that cannot fit is not begun.
+    let ring_size = ring_bytes(options.bitrate_kbps, options.audio.len(), options.buffer_secs);
+    if let Err(err) = room_to_begin(ring_size, sys::free_bytes(&ring_dir)) {
+        return failed(&format!("{err} (the buffer is kept in {})", ring_dir.display()));
+    }
     let ffmpeg = ffmpeg::locate();
     let has = ffmpeg::abilities(&ffmpeg);
     if has.version.is_empty() {
@@ -638,7 +917,12 @@ pub fn run(options: Options) -> ExitCode {
     }
     note!("{} at {}", has.version, ffmpeg.display());
     let out_dir = std::path::absolute(&options.out_dir).unwrap_or_else(|_| options.out_dir.clone());
-    let (video, canvas) = match choose_video(&ffmpeg, &has, &options) {
+    // What a recorder that was ended while it saved left half written.
+    for left in stale_partials(&out_dir) {
+        note!("clearing away a clip left half written: {}", left.display());
+        let _ = std::fs::remove_file(left);
+    }
+    let Chosen { video, canvas, monitor } = match choose_video(&ffmpeg, &has, &options) {
         Ok(chosen) => chosen,
         Err(err) => return failed(&err),
     };
@@ -654,7 +938,6 @@ pub fn run(options: Options) -> ExitCode {
             None
         }
     };
-    let ring_dir = crate::sys::ring_dir();
     if let Err(err) = std::fs::create_dir_all(&ring_dir) {
         return failed(&format!("the ring directory {} could not be made: {err}", ring_dir.display()));
     }
@@ -666,10 +949,10 @@ pub fn run(options: Options) -> ExitCode {
             let _ = std::fs::remove_dir_all(left);
         }
     }
-    note!("ring in {}", ring_dir.display());
+    note!("ring in {}, about {} MB when it is full", ring_dir.display(), megabytes(ring_size));
 
     let stop = Arc::new(AtomicBool::new(false));
-    let sink = Arc::new(Mutex::new(Sink::default()));
+    let sink = Arc::new(Mutex::new(Sink::for_tracks(options.audio.len())));
     let mut threads = Vec::new();
     if !options.audio.is_empty() {
         let table = Arc::new(ProcessTable::default());
@@ -688,8 +971,13 @@ pub fn run(options: Options) -> ExitCode {
     let mut recorder = Recorder {
         ffmpeg,
         screen: video.clone(),
+        first: video.clone(),
         video,
         canvas,
+        monitor,
+        better_at: None,
+        better_wait: BETTER_AFTER,
+        disk_looked: Instant::now(),
         // Only where a game's window can be told at all.
         waiting: (options.wait_for_game && follow.is_some()).then(Instant::now),
         follow,
@@ -700,7 +988,7 @@ pub fn run(options: Options) -> ExitCode {
         out_dir,
         ring: ring_dir.clone(),
         sink,
-        leash: ChildLeash::new(),
+        leash: crate::sys::leash(),
         audio_offset_ms,
         running: None,
         restart_at: None,
@@ -711,30 +999,39 @@ pub fn run(options: Options) -> ExitCode {
     let (words_in, words) = mpsc::channel();
     listen(words_in);
     let mut code = ExitCode::SUCCESS;
+    let mut gave_up = None;
     if recorder.waiting.is_some() {
         note!("nothing is recorded until the game's window is on screen (for {} s at most)", WINDOW_WAIT.as_secs());
     }
     // Waiting, there is no ffmpeg yet: `follow_game` starts it.
     if let Err(err) = if recorder.waiting.is_some() { Ok(()) } else { recorder.start() } {
         code = failed(&err);
+        gave_up = Some(err);
     } else {
         loop {
             match words.recv_timeout(LOOK_EVERY) {
-                Ok(Word::Save) => match recorder.save() {
-                    // The one thing ever written to stdout: the daemon reads it as the clip.
-                    Ok(path) => {
-                        let mut stdout = std::io::stdout().lock();
-                        let _ = writeln!(stdout, "{}", path.display());
-                        let _ = stdout.flush();
-                    }
-                    Err(err) => note!("save failed: {err}"),
-                },
+                Ok(Word::Save) => {
+                    // The one thing ever written to stdout is the answer to
+                    // a `save`: the clip's path, which the daemon reads as
+                    // the clip, or why there is none.
+                    let answer = match recorder.save() {
+                        Ok(path) => path.display().to_string(),
+                        Err(err) => {
+                            note!("save failed: {err}");
+                            save_failed_line(&err)
+                        }
+                    };
+                    let mut stdout = std::io::stdout().lock();
+                    let _ = writeln!(stdout, "{answer}");
+                    let _ = stdout.flush();
+                }
                 Ok(Word::Stop) | Err(RecvTimeoutError::Disconnected) => break,
                 Err(RecvTimeoutError::Timeout) => {}
             }
             recorder.follow_game();
             if let Err(err) = recorder.look_after_ffmpeg() {
                 code = failed(&err);
+                gave_up = Some(err);
                 break;
             }
         }
@@ -748,7 +1045,11 @@ pub fn run(options: Options) -> ExitCode {
     ring::clear(&ring_dir);
     // The directory was made for this run alone.
     let _ = std::fs::remove_dir(&ring_dir);
-    note!("stopped");
+    match gave_up {
+        // The last line is the one the daemon shows for why it ended.
+        Some(why) => note!("stopped: {why}"),
+        None => note!("stopped"),
+    }
     code
 }
 
@@ -781,6 +1082,121 @@ mod tests {
         assert_eq!(restart_delay(1), Duration::from_millis(500));
         assert!(restart_delay(3) > restart_delay(2));
         assert_eq!(restart_delay(50), restart_delay(8));
+    }
+
+    #[test]
+    fn a_save_that_failed_is_answered_with_a_line_that_is_no_path() {
+        let line = save_failed_line("the pieces could not be joined: exit status: 1\nmore");
+        assert_eq!(line, "save-failed: the pieces could not be joined: exit status: 1 more");
+        assert!(!Path::new(&line).is_absolute(), "a reader that only knows paths passes over it");
+        assert_eq!(line.lines().count(), 1);
+    }
+
+    #[test]
+    fn only_clips_left_half_written_are_cleared_away() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["Replay_2026-11-20_18-04-09.mp4", "Replay_2026-11-20_18-04-09.mp4.part", "Replay_2026-11-20_18-04-09_2.mp4.part", "holiday.mp4.part", "Replay_notes.part"] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        let found: Vec<String> = stale_partials(dir.path()).iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        assert_eq!(found, ["Replay_2026-11-20_18-04-09.mp4.part", "Replay_2026-11-20_18-04-09_2.mp4.part"]);
+        assert!(stale_partials(&dir.path().join("missing")).is_empty());
+    }
+
+    #[test]
+    fn a_ring_is_begun_only_where_it_fits() {
+        // A minute at 20 Mbit/s with three tracks: about 190 MB.
+        let ring = ring_bytes(20_000, 3, 60);
+        assert!((180_000_000..200_000_000).contains(&ring), "{ring}");
+        assert_eq!(room_to_begin(ring, None), Ok(()), "where it cannot be told, it is tried");
+        assert_eq!(room_to_begin(ring, Some(ring + ROOM_TO_SPARE)), Ok(()));
+        let err = room_to_begin(ring, Some(ring)).unwrap_err();
+        assert!(err.starts_with(NO_ROOM) && err.contains("MB are free"), "{err}");
+        // A day of buffer is more than was meant, however big the disk.
+        let day = ring_bytes(20_000, 3, 86_400);
+        let err = room_to_begin(day, Some(u64::MAX)).unwrap_err();
+        assert!(err.starts_with(NO_ROOM) && err.contains("the most one may"), "{err}");
+        // The longest buffer the app offers, at a bitrate above any it sets.
+        assert_eq!(room_to_begin(ring_bytes(150_000, 3, 600), Some(u64::MAX)), Ok(()));
+    }
+
+    #[test]
+    fn a_disk_that_fills_up_ends_the_recording_with_its_own_reason() {
+        assert_eq!(room_to_go_on(None), Ok(()));
+        assert_eq!(room_to_go_on(Some(LEAST_ROOM)), Ok(()));
+        let err = room_to_go_on(Some(LEAST_ROOM - 1)).unwrap_err();
+        assert!(err.starts_with(NO_ROOM), "{err}");
+        // A clip that does not fit where the clips go is that save's failure.
+        assert_eq!(room_for_clip(100 << 20, Some(200 << 20)), Ok(()));
+        assert_eq!(room_for_clip(100 << 20, None), Ok(()));
+        assert!(room_for_clip(100 << 20, Some(100 << 20)).unwrap_err().starts_with(NO_ROOM));
+    }
+
+    fn screen(grab: Grab, frames: Frames, family: Family) -> Video {
+        let encoder = ffmpeg::encoders(Codec::H264).into_iter().find(|e| e.family == family).unwrap();
+        Video { grab, frames, encoder, fps: 60, cursor: true, scale: None, bitrate_kbps: 20_000 }
+    }
+
+    fn monitor(size: (u32, u32), output_idx: Option<u32>) -> Monitor {
+        Monitor { name: "DISPLAY1".into(), size, origin: (0, 0), primary: true, output_idx, handle: 65537 }
+    }
+
+    #[test]
+    fn a_monitor_given_another_mode_is_recorded_at_the_size_it_has_now() {
+        let was = screen(Grab::Ddagrab { output_idx: 0 }, Frames::Gpu, Family::Nvenc);
+        // Nothing changed: the same way, the same size.
+        assert_eq!(screen_now(&was, &monitor((2560, 1440), Some(0)), None), Some((was.clone(), (2560, 1440))));
+        // 1440p became 1080p: the pictures are 1080p from here on, which
+        // is what makes the ring start over.
+        let (now, canvas) = screen_now(&was, &monitor((1920, 1080), Some(0)), None).unwrap();
+        assert_eq!((now, canvas), (was.clone(), (1920, 1080)));
+        // The copied pixels are asked for at the size and place it has now.
+        let pixels = screen(Grab::Gdigrab { origin: (0, 0), size: (2560, 1440) }, Frames::Memory, Family::Software);
+        let moved = Monitor { origin: (-1920, 0), ..monitor((1920, 1080), None) };
+        let (now, canvas) = screen_now(&pixels, &moved, None).unwrap();
+        assert_eq!(now.grab, Grab::Gdigrab { origin: (-1920, 0), size: (1920, 1080) });
+        assert_eq!(canvas, (1920, 1080));
+        // Plugged in again, it has another handle and another place among the outputs.
+        let again = Monitor { handle: 131073, ..monitor((2560, 1440), Some(1)) };
+        assert_eq!(screen_now(&was, &again, None).unwrap().0.grab, Grab::Ddagrab { output_idx: 1 });
+        let graphics = screen(Grab::Gfxcapture { hmonitor: 65537 }, Frames::Gpu, Family::Amf);
+        assert_eq!(screen_now(&graphics, &again, None).unwrap().0.grab, Grab::Gfxcapture { hmonitor: 131073 });
+    }
+
+    #[test]
+    fn a_size_that_was_asked_for_is_kept_whatever_the_monitors_mode() {
+        // `-s 1920x1080` on a 1440p monitor: scaled, and still 1080p when
+        // the monitor itself becomes 1080p, with nothing left to scale.
+        let mut was = screen(Grab::Gfxcapture { hmonitor: 65537 }, Frames::Gpu, Family::Nvenc);
+        was.scale = Some((1920, 1080));
+        let (now, canvas) = screen_now(&was, &monitor((1920, 1080), Some(0)), Some((1920, 1080))).unwrap();
+        assert_eq!((now.scale, canvas), (None, (1920, 1080)), "the same size: the ring is kept");
+        let (back, canvas) = screen_now(&now, &monitor((2560, 1440), Some(0)), Some((1920, 1080))).unwrap();
+        assert_eq!((back.scale, canvas), (Some((1920, 1080)), (1920, 1080)));
+        // Desktop Duplication kept on the card cannot be scaled: another
+        // way has to be chosen, as it has when the monitor left the first card.
+        let dda = screen(Grab::Ddagrab { output_idx: 0 }, Frames::Gpu, Family::Nvenc);
+        assert_eq!(screen_now(&dda, &monitor((2560, 1440), Some(0)), Some((1920, 1080))), None);
+        assert_eq!(screen_now(&dda, &monitor((1920, 1080), None), None), None);
+        let downloaded = Video { frames: Frames::Memory, ..dda };
+        assert_eq!(screen_now(&downloaded, &monitor((2560, 1440), Some(0)), Some((1920, 1080))).unwrap().0.scale, Some((1920, 1080)));
+    }
+
+    #[test]
+    fn the_way_it_began_with_is_tried_again_ever_less_often() {
+        let mut wait = BETTER_AFTER;
+        let mut waits = Vec::new();
+        for _ in 0..8 {
+            waits.push(wait.as_secs() / 60);
+            wait = next_better_wait(wait);
+        }
+        assert_eq!(waits, [5, 10, 20, 40, 60, 60, 60, 60]);
+        // Which way it is, is told without the monitor's place or size.
+        let dda = screen(Grab::Ddagrab { output_idx: 0 }, Frames::Gpu, Family::Nvenc);
+        assert!(same_way(&dda, &Video { grab: Grab::Ddagrab { output_idx: 2 }, scale: Some((1280, 720)), ..dda.clone() }));
+        assert!(!same_way(&dda, &Video { frames: Frames::Memory, ..dda.clone() }));
+        assert!(!same_way(&dda, &screen(Grab::Gdigrab { origin: (0, 0), size: (1920, 1080) }, Frames::Gpu, Family::Nvenc)));
+        assert!(!same_way(&dda, &screen(Grab::Ddagrab { output_idx: 0 }, Frames::Gpu, Family::Software)));
     }
 
     fn follow(keeps_flowing: bool) -> Follow {

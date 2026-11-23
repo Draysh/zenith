@@ -1,6 +1,53 @@
 //! What the recorder can do on this machine, asked of the recorder itself:
 //! the monitors (their names and sizes) and the codecs the GPU encodes.
 
+use std::io::Read;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+/// How long the recorder gets to answer a question about the machine. It
+/// answers in well under a second; one that hangs (a display server that
+/// does not reply, a sound server that is gone) must not hang the asker.
+pub const ASK_WITHIN: Duration = Duration::from_secs(8);
+
+/// Run `command` and give what it printed and whether it ended well, when
+/// it ended within `within`. One that takes longer is ended and counts as
+/// not having answered.
+pub fn said_within(mut command: Command, within: Duration) -> Option<(bool, String)> {
+    let mut child = command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
+    let mut stdout = child.stdout.take()?;
+    // Read aside, so that a full pipe never stops the program from ending.
+    let (tell, told) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut text = Vec::new();
+        let _ = stdout.read_to_end(&mut text);
+        let _ = tell.send(text);
+    });
+    let until = Instant::now() + within;
+    let ended = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(10)),
+            _ => break None,
+        }
+    };
+    let Some(status) = ended else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    };
+    // It has ended, so what it printed is all there; a helper of its that
+    // lives on and holds the pipe open is not waited for.
+    let text = told.recv_timeout(Duration::from_secs(1)).ok()?;
+    Some((status.success(), String::from_utf8_lossy(&text).into_owned()))
+}
+
+/// Ask the recorder a question it answers by printing a list.
+fn ask(recorder: &str, question: &str) -> Option<(bool, String)> {
+    let mut command = crate::paths::command(recorder);
+    command.arg(question);
+    said_within(command, ASK_WITHIN)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct Output {
@@ -24,11 +71,7 @@ pub fn parse(text: &str) -> Vec<Output> {
 /// The monitors the recorder can capture, as it sees them (a turned monitor
 /// has its sides swapped). Empty when it cannot be asked.
 pub fn list(recorder: &str) -> Vec<Output> {
-    crate::paths::command(recorder)
-        .arg("--list-capture-options")
-        .output()
-        .map(|out| parse(&String::from_utf8_lossy(&out.stdout)))
-        .unwrap_or_default()
+    ask(recorder, "--list-capture-options").map(|(_, text)| parse(&text)).unwrap_or_default()
 }
 
 /// Read the codecs out of the recorder's `--info`: the lines of its
@@ -47,11 +90,7 @@ pub fn parse_codecs(text: &str) -> Vec<String> {
 /// The codecs this machine's GPU can record with (`h264`, `hevc`, `av1`
 /// among others). Empty when the recorder cannot be asked.
 pub fn codecs(recorder: &str) -> Vec<String> {
-    crate::paths::command(recorder)
-        .arg("--info")
-        .output()
-        .map(|out| parse_codecs(&String::from_utf8_lossy(&out.stdout)))
-        .unwrap_or_default()
+    ask(recorder, "--info").map(|(_, text)| parse_codecs(&text)).unwrap_or_default()
 }
 
 /// What to record for a `source` setting: the recorder's `-w` value and the
@@ -113,8 +152,7 @@ pub fn parse_audio_devices(text: &str) -> Vec<AudioDevice> {
 /// The devices sound can be recorded from here; none when the recorder
 /// cannot be asked.
 pub fn audio_devices(recorder: &str) -> Vec<AudioDevice> {
-    let out = crate::paths::command(recorder).arg("--list-audio-devices").stdin(std::process::Stdio::null()).output();
-    out.ok().filter(|o| o.status.success()).map(|o| parse_audio_devices(&String::from_utf8_lossy(&o.stdout))).unwrap_or_default()
+    ask(recorder, "--list-audio-devices").filter(|(well, _)| *well).map(|(_, text)| parse_audio_devices(&text)).unwrap_or_default()
 }
 
 /// The device to record from: the one chosen while it is plugged in, the
@@ -145,6 +183,22 @@ mod tests {
         assert_eq!(present("mic.usb", DEFAULT_INPUT, &devices), "mic.usb");
         assert_eq!(present("mic.gone", DEFAULT_INPUT, &devices), DEFAULT_INPUT);
         assert_eq!(present("mic.gone", DEFAULT_INPUT, &[]), "mic.gone", "with nothing to go by, the choice stands");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_program_that_does_not_answer_in_time_is_ended() {
+        let sh = |script: &str| {
+            let mut command = Command::new("sh");
+            command.args(["-c", script]);
+            command
+        };
+        assert_eq!(said_within(sh("echo 'DP-1|1x1'"), Duration::from_secs(5)), Some((true, "DP-1|1x1\n".to_string())));
+        assert_eq!(said_within(sh("echo no; exit 3"), Duration::from_secs(5)), Some((false, "no\n".to_string())));
+        let began = Instant::now();
+        assert_eq!(said_within(sh("echo early; exec sleep 30"), Duration::from_millis(200)), None);
+        assert!(began.elapsed() < Duration::from_secs(5), "it was not waited for");
+        assert_eq!(said_within(Command::new("/nonexistent/recorder"), Duration::from_secs(1)), None);
     }
 
     fn out(name: &str, w: u32, h: u32) -> Output {

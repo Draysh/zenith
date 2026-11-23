@@ -62,6 +62,13 @@ Window {
     // Ten seconds of running is a good start: a version on trial is kept.
     Timer { interval: 10 * 1000; running: true; onTriggered: Updates.startedWell() }
 
+    // Start the new version in this one's place. Zenith only closes when
+    // that was begun; when it could not be, it stays and says why.
+    function restartToFinish() {
+        const why = Updates.restart()
+        if (why === "") { Qt.quit() } else { say(why) }
+    }
+
     function say(message) {
         settleTrash()
         toast.text = message
@@ -89,13 +96,34 @@ Window {
         toast.undo = false
         library.finishTrash()
     }
-    // Closing does not leave clips half way to the trash.
-    onClosing: { toast.undo = false; Library.finishTrashNow() }
+    // Closing while an export runs is asked about first: it would stop
+    // the export. Otherwise (or once that is answered) closing leaves
+    // nothing half done: no clips half way to the trash, no setting changed
+    // a moment ago and not kept yet, no last steps of a clip's sync unkept.
+    // (What is still running then, an export that was to be stopped, is
+    // seen to an end after the window has gone: see `main.rs`.)
+    property bool closeAnyway: false
+    onClosing: close => {
+        if (Editor.exportBusy() && !closeAnyway) {
+            close.accepted = false
+            closeSheet.show()
+            return
+        }
+        toast.undo = false
+        Library.finishTrashNow()
+        if (editor.item && editor.item.flush) { editor.item.flush() }
+        Editor.settle()
+        // Closed by its user is a start that went well, however short: a
+        // version on trial is not taken back for being closed quickly.
+        Updates.startedWell()
+    }
 
     Rectangle { anchors.fill: parent; color: Theme.bg }
 
     Item {
         id: top
+        // Everything under the question about closing waits for its answer.
+        enabled: !closeSheet.open
         height: window.ownFrame ? 44 : 56
         anchors.left: parent.left
         anchors.right: parent.right
@@ -149,7 +177,7 @@ Window {
                     : window.updates.state === "downloading" ? "Updating  " + Math.round(window.updates.progress * 100) + "%"
                     : "Update to " + window.updates.latest
                 onClicked: {
-                    if (window.updates.state === "ready") { Updates.restart(); Qt.quit() }
+                    if (window.updates.state === "ready") { window.restartToFinish() }
                     else if (window.updates.here === "portable") { Updates.install() }
                     else { editor.setSource("SettingsPage.qml", {}) }
                 }
@@ -208,6 +236,7 @@ Window {
 
     LibraryPage {
         id: library
+        enabled: !closeSheet.open
         visible: editor.item === null
         anchors.top: top.bottom
         anchors.bottom: parent.bottom
@@ -224,6 +253,7 @@ Window {
     Rectangle { anchors.fill: editor; color: Theme.bg; visible: editor.item !== null }
     Loader {
         id: editor
+        enabled: !closeSheet.open
         anchors.fill: parent
         anchors.topMargin: window.ownFrame ? top.height : 0
         focus: true
@@ -231,6 +261,8 @@ Window {
     }
     Connections {
         target: editor.item
+        // Not every page has every one of these to say.
+        ignoreUnknownSignals: true
         function onClosed() { editor.source = ""; library.refresh() }
         // From one clip to another: once the page that asked is done with
         // asking, it goes and the other clip's comes.
@@ -261,6 +293,8 @@ Window {
             if (found) { editor.setSource("EditorPage.qml", { entry: found }) }
         }
         if (Qt.application.arguments.indexOf("--edit") >= 0) {
+            // A library not read yet (a test's fresh one) has its clips first.
+            Library.rescan()
             const clips = JSON.parse(Library.clips("{}"))
             const pick = clips.find(c => c.game !== "Desktop") || clips[0]
             if (pick) { editor.setSource("EditorPage.qml", { entry: pick }) }
@@ -343,6 +377,33 @@ Window {
         Timer { id: toastTimer; interval: 3200; onTriggered: { window.settleTrash(); toast.shown = false } }
     }
 
+    // Closing with an export running: it is the user's to say that the
+    // export is to be stopped.
+    Sheet {
+        id: closeSheet
+        title: "Stop the export and close?"
+        onClosed: (editor.item || library).forceActiveFocus()
+        Text {
+            width: parent.width
+            wrapMode: Text.Wrap
+            text: "An export is still running. Closing Zenith now stops it, and nothing of it is kept."
+            color: Theme.textDim
+            font.family: Theme.family
+            font.pixelSize: Theme.body
+            lineHeight: 1.3
+        }
+        Row {
+            anchors.right: parent.right
+            spacing: 10
+            Btn { text: "Keep exporting"; onClicked: closeSheet.close() }
+            Btn {
+                primary: true
+                text: "Stop and close"
+                onClicked: { closeSheet.open = false; window.closeAnyway = true; Editor.exportCancel(); window.close() }
+            }
+        }
+    }
+
     // The window's own frame: a line around it, and its edges and corners
     // to size it by. The line stays when the window fills the screen; the
     // edges are not for sizing then.
@@ -373,9 +434,16 @@ Window {
         }
     }
 
-    // `--selftest`: edit the newest clip the way a person would (two cuts,
-    // the middle removed, a track muted), export it for Discord, say how
-    // that went on the terminal, and quit. Leaves the clip as it was.
+    // The test modes below (`--selftest`, `--scrolltest`, `--librarytest`,
+    // `--resizetest`) never work on the user's own settings, library or
+    // clips: `main.rs` gives them a folder of their own before anything is
+    // read, with copies of the video named by `--test-clip` (or after
+    // `--librarytest`) as its clips.
+    //
+    // `--edit --selftest`: edit the newest clip the way a person would (two
+    // cuts, the middle removed, a track muted), export it for Discord, say
+    // how that went on the terminal, and quit. Leaves the clip as it was.
+    // `--settings --selftest`: change three settings and keep them.
     Timer {
         interval: 1500
         running: Qt.application.arguments.indexOf("--selftest") >= 0
@@ -407,7 +475,10 @@ Window {
         enabled: Qt.application.arguments.indexOf("--selftest") >= 0
         function onExportFinished(clip, path, bytes, error) {
             console.log("selftest: exported", path, bytes, "bytes", error === "" ? "ok" : error)
-            editor.item.apply(Editor.reset())
+            // Every step taken back, one at a time: the clip as it was.
+            const page = editor.item
+            for (let steps = 0; page.edit.canUndo && steps < 50; steps++) { page.apply(Editor.undo()) }
+            console.log("selftest: undone; the clip is", page.edit.changed ? "still changed" : "as it was")
             Qt.quit()
         }
     }

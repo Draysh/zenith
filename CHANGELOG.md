@@ -5,23 +5,18 @@ what its release on GitHub says and what the app shows under "What is new",
 so it is written for the people using Zenith, and to be worth reading: a
 line at the top that says what the version is about, then what they will
 notice, most important first, each point led by a few words in bold that
-say it. True to what the version does, in plain words, with some life in
-them. A release is not built without one.
+say it. Short and easy to take in: one line a point where that is
+enough, plain words, and only what someone using Zenith will notice. True
+to what the version does. A release is not built without one.
 
 ## 0.11.0
 
-**The editor got a proper player.** Play sits in the middle of the bar with its buttons on both sides, the way every media player you have ever used does it, and a few things around it moved to where you would look for them.
+**The editor has a real player bar.**
 
-### The big stuff
-- **Play is in the middle.** To its left: play from the start, the cut before, a frame back. To its right: a frame on, the cut after, the end. The time is on the left of the bar, the editing on the right. Everything that used to need a key now has a button too (the keys still work).
-- **Sync in steps you can feel.** Minus and plus move the sound 100 ms now, for getting close fast; the wheel over the number is the fine one, 10 ms a notch. A click on the number still puts it back to 0.
-- **Zoom moved up.** Minus and plus for the timeline are in the bar over it, beside the volume, with how far in you are between them. No more two pairs of minus and plus stacked on top of each other.
-
-### Gone, on purpose
-- **"Back to the clip as recorded".** One click threw away every cut, which is a lot for a button sitting next to undo. Undo (Ctrl+Z) takes you back step by step, all the way.
-
-### Small windows
-- **The bar thins out instead of piling up.** As the window gets narrow the player's outer buttons step aside first, then the buttons lose their words, and at the smallest size zooming is left to Ctrl and the wheel.
+- **Play is in the middle.** Frame back, previous cut and play from the start are on its left; frame forward, next cut and jump to the end are on its right.
+- **Sync buttons move 100 ms.** Scroll over the number for fine steps of 10 ms. Click the number to reset it to 0.
+- **Zoom buttons moved.** Minus and plus for the timeline are now in the bar above it, next to the volume.
+- **"Back to the clip as recorded" is gone.** Use undo (Ctrl+Z) to step back instead.
 
 ## 0.10.0
 
